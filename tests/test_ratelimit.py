@@ -74,6 +74,26 @@ def test_429_pauses_all_requests_for_retry_after():
     assert calls[1] - calls[0] >= 0.45
 
 
+def test_tracks_how_long_public_has_refused_the_key():
+    statuses = iter([200, 401, 401, 200])
+
+    def handler(request):
+        return httpx.Response(next(statuses), json={})
+
+    async def run():
+        transport = RateLimitedTransport(RateLimiter(100, PERIOD), httpx.MockTransport(handler))
+        seen = []
+        async with httpx.AsyncClient(transport=transport) as client:
+            for _ in range(4):
+                await client.get("https://example.test/a")
+                seen.append(transport.refused_since)
+        return seen
+
+    ok, first_401, second_401, recovered = asyncio.run(run())
+    assert ok is None and first_401 is not None and recovered is None
+    assert second_401 == first_401  # counts from the first refusal, not the latest
+
+
 def test_cancelled_waiter_does_not_use_a_slot():
     async def run():
         limiter = RateLimiter(1, PERIOD)

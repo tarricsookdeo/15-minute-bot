@@ -1,29 +1,55 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const STATE_POLL_MS = 2000;
 const TRADES_POLL_MS = 5000;
+const TOKEN_KEY = "fifteen-bot-session";
 
-let state = null;          // last /api/state snapshot
+let state = null;          // last dashboard snapshot (pushed over the WebSocket)
 let clockOffsetMs = 0;     // server time - browser time, so countdowns match the engine
 let available = [];        // markets from /api/markets/available
 let editingSeries = [];    // markets the strategy dialog will save to
 let timers = [];
+let socket = null;         // live connection: pushes state, and keeps an idle session alive
+let sessionToken = null;   // this tab's session; see getToken
+let savesSessions = false; // the server keeps sessions (encrypted) through restarts; from /api/info
+let socketRetries = 0;
 
 // --- helpers ----------------------------------------------------------------
 
+// The session token is saved in localStorage, so coming back later (even after closing the
+// browser) rejoins the running bot without the key. Never in a cookie, so other sites can't
+// send requests as this user. Each tab reads it once and keeps its own copy, so connecting a
+// different key in another tab can't redirect this tab's requests to that other session.
+function getToken() {
+  if (sessionToken === null) {
+    try { sessionToken = localStorage.getItem(TOKEN_KEY); } catch { /* storage blocked */ }
+  }
+  return sessionToken;
+}
+function setToken(token) {
+  sessionToken = token;
+  try { localStorage.setItem(TOKEN_KEY, token); } catch { /* storage blocked: lasts until refresh */ }
+}
+function clearToken() {
+  try {
+    if (localStorage.getItem(TOKEN_KEY) === sessionToken) localStorage.removeItem(TOKEN_KEY);
+  } catch { /* nothing stored */ }
+  sessionToken = "";  // not null: don't read back a token another tab saved since
+}
+
 async function api(method, path, body) {
-  const res = await fetch(path, {
-    method,
-    headers: body ? { "Content-Type": "application/json" } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const token = getToken();
+  const headers = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (token) headers["X-Session"] = token;
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const detail = Array.isArray(data.detail)
       ? data.detail.map((d) => d.msg.replace(/^Value error, /, "")).join("; ")
       : data.detail;
-    throw new Error(detail || `Request failed (${res.status})`);
+    if (res.status === 401 && token) sessionEnded(detail);
+    throw Object.assign(new Error(detail || `Request failed (${res.status})`), { status: res.status });
   }
   return data;
 }
@@ -53,8 +79,16 @@ function sideText(side) {
   return { EITHER: "YES or NO", YES: "YES", NO: "NO" }[side];
 }
 
+function exitText(s) {
+  const parts = [];
+  if (s.take_profit !== null && s.take_profit !== undefined) parts.push(`take profit at +${cents(s.take_profit)}`);
+  if (s.stop_loss !== null && s.stop_loss !== undefined) parts.push(`stop loss at −${cents(s.stop_loss)}`);
+  return parts.join(" · ");
+}
+
 function strategyText(s) {
-  return `With ≤ ${clock(s.entry_seconds)} left, buy ${sideText(s.side)} priced ${cents(s.min_price)}–${cents(s.max_price)} · ${num(s.quantity)} contract${num(s.quantity) === 1 ? "" : "s"}`;
+  const exits = exitText(s);
+  return `With ≤ ${clock(s.entry_seconds)} left, buy ${sideText(s.side)} priced ${cents(s.min_price)}–${cents(s.max_price)} · ${num(s.quantity)} contract${num(s.quantity) === 1 ? "" : "s"}${exits ? ` · ${exits}` : ""}`;
 }
 
 function toast(message, isError = false) {
@@ -77,7 +111,10 @@ function confirmAction(title, body, okLabel) {
 
 // --- strategy form (shared by the setup wizard and the edit dialog) -------------
 
-const DEFAULT_STRATEGY = { entry_seconds: 120, cutoff_seconds: 10, min_price: "0.80", max_price: "0.90", side: "EITHER", quantity: "1" };
+const DEFAULT_STRATEGY = {
+  entry_seconds: 120, cutoff_seconds: 10, min_price: "0.80", max_price: "0.90", side: "EITHER", quantity: "1",
+  take_profit: null, stop_loss: null,
+};
 
 function strategyFields() {
   const field = (label, control, hint) =>
@@ -89,6 +126,8 @@ function strategyFields() {
     ${field("Highest chance to buy at", `<div class="inline"><input type="number" name="max_price" min="1" max="99" step="1" required><em>%</em></div>`, "Pricier contracts win more often but pay less")}
     ${field("Which side", `<select name="side"><option value="EITHER">Either YES or NO</option><option value="YES">YES only</option><option value="NO">NO only</option></select>`, "“Either” buys whichever side is in your range")}
     ${field("Contracts per trade", `<input type="number" name="quantity" min="0.01" step="0.01" required>`, "Each winning contract pays out $1.00")}
+    ${field("Take profit at (optional)", `<div class="inline"><input type="number" name="take_profit" min="1" max="98" step="1" placeholder="Off"><em>¢ per contract</em></div>`, "Sells early once each contract is up this much after fees")}
+    ${field("Stop loss at (optional)", `<div class="inline"><input type="number" name="stop_loss" min="1" max="98" step="1" placeholder="Off"><em>¢ per contract</em></div>`, "Sells early once each contract is down this much after fees")}
   </div>`;
 }
 
@@ -100,7 +139,12 @@ function fillStrategy(form, s) {
   f.max_price.value = Math.round(num(s.max_price) * 100);
   f.side.value = s.side;
   f.quantity.value = num(s.quantity);
+  f.take_profit.value = num(s.take_profit) === null ? "" : Math.round(num(s.take_profit) * 100);
+  f.stop_loss.value = num(s.stop_loss) === null ? "" : Math.round(num(s.stop_loss) * 100);
 }
+
+/** A blank exit field means off (null); otherwise cents in the form, dollars in the API. */
+const readTarget = (input) => (input.value.trim() === "" ? null : String(Number(input.value) / 100));
 
 function readStrategy(form) {
   const f = form.elements;
@@ -111,6 +155,8 @@ function readStrategy(form) {
     max_price: (Number(f.max_price.value) / 100).toFixed(2),
     side: f.side.value,
     quantity: f.quantity.value,
+    take_profit: readTarget(f.take_profit),
+    stop_loss: readTarget(f.stop_loss),
   };
 }
 
@@ -122,6 +168,12 @@ function strategyProblem(s) {
   if (!(min >= 0.01 && max <= 0.99)) return "Chances must be between 1% and 99%.";
   if (min > max) return "The lowest chance can't be above the highest chance.";
   if (!(num(s.quantity) > 0)) return "Buy at least one contract per trade.";
+  for (const [target, name] of [[s.take_profit, "Take profit"], [s.stop_loss, "Stop loss"]]) {
+    const c = target === null ? null : Math.round(num(target) * 100 * 1e6) / 1e6;
+    if (c !== null && !(Number.isInteger(c) && c >= 1 && c <= 98)) {
+      return `${name} must be a whole number of cents from 1 to 98, or blank for off.`;
+    }
+  }
   return null;
 }
 
@@ -135,7 +187,21 @@ function strategyPreview(s) {
     <b>${sideText(s.side)}</b> once it's priced <b>${cents(s.min_price)}–${cents(s.max_price)}</b>. At most one trade per window.
     <div class="example"><b>Example:</b> with ${clock(exampleLeft)} left, ${exampleSide} is at ${cents(example)}. The bot buys ${q} ${exampleSide}
     for ${money(q * example, false)}. If ${exampleSide} wins you get ${money(q, false)} back
-    (<span class="pos">${money(q * (1 - example))}</span>); if it loses you lose <span class="neg">${money(q * example, false)}</span>. Fees not included.</div>`;
+    (<span class="pos">${money(q * (1 - example))}</span>); if it loses you lose <span class="neg">${money(q * example, false)}</span>. Fees not included.</div>
+    ${exitPreview(s)}`;
+}
+
+function exitPreview(s) {
+  const lines = [];
+  if (s.take_profit !== null) {
+    lines.push(`once each contract is up <b class="pos">${cents(s.take_profit)}</b> or more after fees, it sells to lock in the profit`);
+  }
+  if (s.stop_loss !== null) {
+    lines.push(`once each contract is down <b class="neg">${cents(s.stop_loss)}</b> or more after fees, it sells to limit the loss`);
+  }
+  if (!lines.length) return `<div class="example">The bot holds every position until the window settles.</div>`;
+  return `<div class="example"><b>Selling early:</b> while the window is open, ${lines.join("; ")}.
+    It sells at the current bid, and re-prices every few seconds until the order fills. If it can't sell in time, the position settles as normal.</div>`;
 }
 
 // --- setup wizard ------------------------------------------------------------------
@@ -152,21 +218,87 @@ const STEPS = [
 const wiz = {
   step: "welcome",
   session: null,
-  returning: false,   // already set up before: just reconnect, no full wizard
   available: null,
   selected: new Set(),
   strategy: { ...DEFAULT_STRATEGY },
 };
 
 async function boot() {
-  const session = await api("GET", "/api/session");
-  wiz.session = session;
-  wiz.returning = session.onboarded;
-  if (session.connected && session.account_id) {
-    return session.onboarded ? showDashboard() : showOnboarding("markets");
+  try {
+    savesSessions = (await api("GET", "/api/info")).saves_sessions;
+  } catch { /* keep the cautious default wording */ }
+  if (!getToken()) return showOnboarding("welcome");
+  let session;
+  try {
+    session = await api("GET", "/api/session");
+  } catch (err) {
+    if (err.status === 503 || err.status === undefined) {
+      // The server is restarting (an update): the session is kept, so wait and try again.
+      $("#conn-banner").classList.remove("hidden");
+      return setTimeout(() => boot().catch((e) => toast(e.message, true)), 3000);
+    }
+    if (getToken()) toast(err.message, true);  // a 401 already returned to the start
+    return;
   }
-  if (session.connected) return showOnboarding("account");
-  showOnboarding(session.onboarded ? "connect" : "welcome");
+  $("#conn-banner").classList.add("hidden");
+  wiz.session = session;
+  openSocket();
+  if (!session.account_id) return showOnboarding("account");
+  if (!session.onboarded) return showOnboarding("markets");
+  showDashboard();
+}
+
+/** Back to the start after the server ended this session (or it expired). */
+function sessionEnded(reason) {
+  resetLocalSession();
+  showOnboarding("connect");
+  if (reason) $("#connect-error").textContent = reason;
+}
+
+function resetLocalSession() {
+  clearToken();
+  $("#conn-banner").classList.add("hidden");
+  const ws = socket;
+  socket = null;
+  ws?.close();
+  stopPolling();
+  state = null;
+  Object.assign(wiz, { session: null, available: null, selected: new Set(), strategy: { ...DEFAULT_STRATEGY } });
+}
+
+async function endSession() {
+  try {
+    await api("DELETE", "/api/session");
+  } catch {
+    /* already ended on the server */
+  }
+  resetLocalSession();
+}
+
+function openSocket() {
+  const token = getToken();
+  if (socket || !token) return;
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  socket = ws;
+  ws.addEventListener("open", () => ws.send(JSON.stringify({ session: token })));
+  ws.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "state") {
+      socketRetries = 0;
+      $("#conn-banner").classList.add("hidden");
+      if (!$("#dash-view").classList.contains("hidden")) setState(message.state);
+    } else if (message.type === "ended") {
+      sessionEnded(message.reason);
+    }
+  });
+  ws.addEventListener("close", () => {
+    if (socket !== ws) return;  // closed on purpose
+    socket = null;
+    if (!getToken()) return;
+    // The bot keeps trading on the server without a tab, so just reconnect.
+    $("#conn-banner").classList.remove("hidden");
+    setTimeout(openSocket, Math.min(1000 * 2 ** socketRetries++, 10000));
+  });
 }
 
 function showOnboarding(step) {
@@ -180,7 +312,6 @@ function goTo(step) {
   wiz.step = step;
   const index = STEPS.findIndex(([key]) => key === step);
   const stepper = $("#stepper");
-  stepper.classList.toggle("hidden", wiz.returning);
   stepper.innerHTML = STEPS.map(([, label], i) => {
     const status = i < index ? "done" : i === index ? "current" : "";
     return `<li class="${status}" ${i === index ? 'aria-current="step"' : ""}><span class="n">${i < index ? "✓" : i + 1}</span><span class="label">${label}</span></li>`;
@@ -198,24 +329,19 @@ const WIZARD_STEPS = {
     <h1 tabindex="-1">Let's set up your trading bot</h1>
     <p class="lead">In a few minutes you'll have a bot that watches Public's 15-minute prediction markets and trades them using rules you choose.</p>
     <div class="how">
-      <div class="how-item"><span class="badge">1</span><div><b>Connect your Public account</b><p>Using an API key from Public. It stays on this computer.</p></div></div>
+      <div class="how-item"><span class="badge">1</span><div><b>Connect your Public account</b><p>Using an API key from Public. ${savesSessions
+        ? "It's stored encrypted, so your bot keeps running through server updates, and deleted when you disconnect."
+        : "It's held in the server's memory only while your bot exists, never written to disk."}</p></div></div>
       <div class="how-item"><span class="badge">2</span><div><b>Pick the markets to trade</b><p>BTC, gold, EUR/USD and more. Each one asks a new yes/no question every 15 minutes.</p></div></div>
       <div class="how-item"><span class="badge">3</span><div><b>Set your rule</b><p>For example: “with 2 minutes left, buy whichever side is priced 80–90¢”.</p></div></div>
     </div>
-    <div class="callout warn"><b>This bot trades with real money.</b> It places real orders in your Public account. Nothing is traded until you press <b>Start</b>, and you can stop it at any time.</div>
+    <div class="callout warn"><b>This bot trades with real money.</b> It places real orders in your Public account. Nothing is traded until you press <b>Start</b>, and you can stop it at any time.
+      Once started, it keeps trading even after you close this page or turn off your computer.</div>
     <div class="wizard-actions"><span></span><button type="button" class="btn primary" data-go="connect">Get started →</button></div>`,
 
-  connect: () => {
-    const saved = wiz.session?.has_saved_key;
-    return `
-    <h1 tabindex="-1">${wiz.returning ? "Welcome back" : "Connect your Public account"}</h1>
-    <p class="lead">${wiz.returning ? "Connect to Public to pick up where you left off." : "The bot uses a Public API key to read prices and place orders for you. Here's how to get one:"}</p>
-    ${saved ? `
-      <div class="callout">
-        <p><b>Your key is saved on this computer.</b></p>
-        <button type="button" class="btn primary" data-action="use-saved" id="saved-btn">Connect with saved key</button>
-      </div>
-      <details class="faq different-key"><summary>Use a different key</summary>` : ""}
+  connect: () => `
+    <h1 tabindex="-1">Connect your Public account</h1>
+    <p class="lead">The bot uses a Public API key to read prices and place orders for you. Here's how to get one:</p>
     <ol class="steps-list">
       <li>
         <b>Open Public's API settings</b>
@@ -233,25 +359,26 @@ const WIZARD_STEPS = {
             <input type="password" id="api-key" spellcheck="false" placeholder="Paste your secret key" aria-label="Public API secret key">
             <button type="button" class="btn ghost" data-action="toggle-key">Show</button>
           </div>
-          <label class="check"><input type="checkbox" id="remember" checked>
-            <span>Remember on this computer. It's saved in your system keychain so you won't need to paste it again.</span></label>
           <button class="btn primary" type="submit" id="connect-btn">Connect</button>
         </form>
       </li>
     </ol>
-    ${saved ? "</details>" : ""}
     <p class="error" id="connect-error" role="alert"></p>
     <details class="faq">
       <summary>How is my key kept safe?</summary>
       <ul>
-        <li>It's only sent to this app, which runs on your computer, and to Public over an encrypted connection.</li>
-        <li>It's never written to the project folder or the trade database, and never shown on this page again.</li>
-        <li>If you tick “Remember”, it's stored in your system keychain.</li>
+        <li>It travels over an encrypted connection to this app's server, and from there only to Public.</li>
+        <li>${savesSessions
+          ? "The server stores it encrypted in its database, so your bot keeps running through server updates. It's never written to logs, and never shown on this page again."
+          : "The server keeps it in memory only. It's never written to disk or to logs, and never shown on this page again."}</li>
+        <li>This browser remembers your session, not your key, so you can come back to your running bot without pasting the key again.</li>
+        <li>${savesSessions
+          ? "The key is deleted when you click Disconnect, or after a day with the bot stopped and no page open."
+          : "The key is forgotten when you click Disconnect, after a day with the bot stopped and no page open, or when the server restarts."}</li>
         <li>You can delete the key in Public's API settings at any time, which stops it working immediately.</li>
       </ul>
     </details>
-    ${wiz.returning ? "" : `<div class="wizard-actions">${backButton("welcome")}<span></span></div>`}`;
-  },
+    <div class="wizard-actions">${backButton("welcome")}<span></span></div>`,
 
   account: () => {
     const accounts = wiz.session.accounts;
@@ -319,7 +446,9 @@ const WIZARD_STEPS = {
       </ol>
     </div>
     <p class="muted small">You can stop the bot at any time with the button in the top bar.
-      Keep this app running (the terminal window) for the bot to trade.</p>
+      <b>The bot keeps trading after you close this page.</b> Come back in this browser to check on it, or paste
+      the same key on another device. To end it, click <b>Disconnect</b>: the bot stops, unfilled orders are cancelled,
+      and your settings and results here are cleared. Contracts you already bought stay in your Public account.</p>
     <p class="error" id="finish-error" role="alert"></p>
     <div class="wizard-actions">
       ${backButton("strategy")}
@@ -410,26 +539,35 @@ function updateWizardCount() {
   $("#markets-next").disabled = n === 0;
 }
 
-async function connectFromWizard(body) {
+async function connectFromWizard(apiKey) {
   const error = $("#connect-error");
-  const button = body.use_saved ? $("#saved-btn") : $("#connect-btn");
+  const button = $("#connect-btn");
   const label = button.textContent;
   error.textContent = "";
-  if (!body.use_saved && !body.api_key.trim()) {
+  if (!apiKey.trim()) {
     error.textContent = "Paste your secret key first.";
     return;
   }
   button.disabled = true;
   button.textContent = "Checking your key with Public…";
+  let result;
   try {
-    wiz.session = await api("POST", "/api/connect", body);
+    result = await api("POST", "/api/connect", { api_key: apiKey });
   } catch (err) {
     error.textContent = err.message;
     button.disabled = false;
     button.textContent = label;
     return;
   }
-  if (wiz.returning && wiz.session.account_id) return showDashboard();
+  const { token, ...session } = result;
+  setToken(token);
+  wiz.session = session;
+  openSocket();
+  if (session.account_id && session.onboarded) {
+    // The same key is already running in another tab: this tab joins that session.
+    showDashboard();
+    return toast("Joined your running session.");
+  }
   goTo("account");
 }
 
@@ -443,7 +581,6 @@ async function finishWizard(start) {
     $("#onboard-body").querySelectorAll(".wizard-actions button").forEach((b) => (b.disabled = false));
     return;
   }
-  wiz.returning = true;
   showDashboard();
   toast(start ? "You're all set. The bot is trading." : "You're all set. Press Start when you're ready.");
 }
@@ -452,14 +589,13 @@ $("#onboard-body").addEventListener("click", async (e) => {
   const go = e.target.closest("[data-go]")?.dataset.go;
   if (go) return goTo(go);
   const action = e.target.closest("[data-action]")?.dataset.action;
-  if (action === "use-saved") connectFromWizard({ use_saved: true });
   if (action === "toggle-key") {
     const input = $("#api-key");
     input.type = input.type === "password" ? "text" : "password";
     e.target.textContent = input.type === "password" ? "Show" : "Hide";
   }
   if (action === "different-key") {
-    wiz.session = await api("POST", "/api/disconnect", { forget_key: false });
+    await endSession();
     goTo("connect");
   }
   if (action === "choose-account") {
@@ -470,7 +606,7 @@ $("#onboard-body").addEventListener("click", async (e) => {
     } catch (err) {
       return ($("#account-error").textContent = err.message);
     }
-    if (wiz.returning) showDashboard();
+    if (wiz.session.onboarded) showDashboard();
     else goTo("markets");
   }
   if (action === "markets-next") goTo("strategy");
@@ -495,7 +631,7 @@ $("#onboard-body").addEventListener("change", (e) => {
 $("#onboard-body").addEventListener("submit", (e) => {
   e.preventDefault();
   if (e.target.id !== "connect-form") return;
-  connectFromWizard({ api_key: $("#api-key").value, remember: $("#remember").checked });
+  connectFromWizard($("#api-key").value);
 });
 
 // --- dashboard ----------------------------------------------------------------
@@ -504,13 +640,10 @@ function showDashboard() {
   $("#onboard-view").classList.add("hidden");
   $("#dash-view").classList.remove("hidden");
   stopPolling();
-  refreshState();
+  openSocket();
+  refreshState();  // render now rather than waiting for the next push
   refreshTrades();
-  timers = [
-    setInterval(refreshState, STATE_POLL_MS),
-    setInterval(refreshTrades, TRADES_POLL_MS),
-    setInterval(tickCountdowns, 1000),
-  ];
+  timers = [setInterval(refreshTrades, TRADES_POLL_MS), setInterval(tickCountdowns, 1000)];
 }
 
 function stopPolling() {
@@ -520,11 +653,9 @@ function stopPolling() {
 
 async function refreshState() {
   try {
-    const next = await api("GET", "/api/state");
-    if (!next.connected) return boot();
-    setState(next);
+    setState(await api("GET", "/api/state"));
   } catch (err) {
-    toast(`Lost contact with the bot: ${err.message}`, true);
+    if (getToken()) toast(`Couldn't reach the bot: ${err.message}`, true);
   }
 }
 
@@ -547,9 +678,13 @@ function renderTopbar() {
 }
 
 /** The card's live view of a trade that hasn't settled yet. */
+const EXIT_LABELS = { TAKE_PROFIT: "take-profit", STOP_LOSS: "stop-loss" };
+
 function positionBlock(p) {
-  const filled = num(p.filled), quantity = num(p.quantity);
-  const what = `${esc(p.side)} ×${filled}${filled !== quantity ? ` of ${quantity}` : ""} @ ${cents(p.avg_price)}`;
+  const filled = num(p.filled), quantity = num(p.quantity), sold = num(p.sold) ?? 0;
+  const what = `${esc(p.side)} ×${filled}${filled !== quantity ? ` of ${quantity}` : ""} @ ${cents(p.avg_price)}`
+    + (sold > 0 ? ` · ${sold} sold` : "");
+  const selling = p.selling ? ` · selling (${EXIT_LABELS[p.exit_reason] ?? "early exit"})` : "";
   if (filled === 0) {
     return `<div class="position"><div class="position-head"><span>Order open</span><span class="muted">${esc(p.side)} ×${quantity} @ ${cents(p.avg_price)}, waiting to fill</span></div></div>`;
   }
@@ -560,7 +695,7 @@ function positionBlock(p) {
   }
   const pnl = p.pnl === null
     ? `<b class="muted">—</b><span class="muted small">no bid right now</span>`
-    : `<b class="${pnlClass(p.pnl)}">${money(p.pnl)}</b><span class="muted small">at ${cents(p.bid)} bid${p.order_open ? " · order still filling" : ""}</span>`;
+    : `<b class="${pnlClass(p.pnl)}">${money(p.pnl)}</b><span class="muted small">at ${cents(p.bid)} bid${p.order_open ? " · order still filling" : ""}${selling}</span>`;
   return `<div class="position"><div class="position-head"><span>Your position</span><span class="muted">${what}</span></div>
     <div class="position-pnl"><span class="muted small">Live P/L</span>${pnl}</div>${outcomes}</div>`;
 }
@@ -654,7 +789,15 @@ function cardStatus(m) {
     if (t.result === "REJECTED" || t.result === "ERROR") return { tone: "bad", label: "Order rejected", detail: t.note || order };
     if (t.result === "UNFILLED") return { tone: "idle", label: "Order didn't fill", detail: order };
     if (num(t.filled) === 0) return { tone: "active", label: "Order placed, waiting to fill", detail: order };
-    return { tone: "good", label: `Bought ${t.side} ×${num(t.filled)} @ ${cents(t.price)}`, detail: "Done for this window" };
+    const sold = num(t.sold) ?? 0, reason = EXIT_LABELS[t.exit_reason] ?? "early exit";
+    if (sold > 0 && sold >= num(t.filled)) {
+      return { tone: "good", label: `Sold ${t.side} ×${sold} early (${reason})`, detail: "Done for this window" };
+    }
+    return {
+      tone: "good",
+      label: `Bought ${t.side} ×${num(t.filled)} @ ${cents(t.price)}`,
+      detail: sold > 0 ? `${sold} sold early (${reason}), the rest held` : "Done for this window",
+    };
   }
   if (!m.enabled) return { tone: "idle", label: "Off", detail: "Switch on to trade this market." };
   if (!state.running) return { tone: "idle", label: "Engine stopped", detail: "Press Start in the top bar to trade." };
@@ -774,7 +917,9 @@ async function refreshTrades() {
         <td class="num">${qty}</td>
         <td class="num">${cents(t.avg_price ?? t.limit_price)}</td>
         <td class="num">${t.seconds_left ?? "—"}s</td>
-        <td><span class="pill ${esc(t.result)}">${esc(t.result.toLowerCase())}</span></td>
+        <td><span class="pill ${esc(t.result)}">${esc(t.result.toLowerCase())}</span>${num(t.sold_quantity) > 0 && t.result !== "SOLD"
+          ? ` <span class="muted small">${num(t.sold_quantity)} sold early</span>` : ""}${t.exit_reason && num(t.sold_quantity) > 0
+          ? ` <span class="muted small">(${esc(EXIT_LABELS[t.exit_reason] ?? t.exit_reason)})</span>` : ""}</td>
         <td class="num ${pnlClass(t.pnl)}">${t.pnl === null ? "—" : money(t.pnl)}</td>
       </tr>`;
     }).join("") || `<tr><td colspan="8" class="muted">No trades yet.</td></tr>`;
@@ -792,7 +937,7 @@ $("#engine-btn").addEventListener("click", async () => {
     const enabled = state.markets.filter((m) => m.enabled).length;
     const ok = await confirmAction(
       "Start trading?",
-      `The bot will place real buy orders on account ${state.account_id} for ${enabled} enabled market${enabled === 1 ? "" : "s"} as soon as a market's rule matches. You can lose the full amount you pay for each contract.`,
+      `The bot will place real orders on account ${state.account_id} for ${enabled} enabled market${enabled === 1 ? "" : "s"}: buys as soon as a market's rule matches, and early sells where a rule sets a take-profit or stop-loss. You can lose the full amount you pay for each contract.`,
       "Start",
     );
     if (!ok) return;
@@ -805,14 +950,14 @@ $("#engine-btn").addEventListener("click", async () => {
 });
 
 $("#disconnect-btn").addEventListener("click", async () => {
-  const ok = await confirmAction("Disconnect?", "The engine stops. Your markets, strategies and history are kept.", "Disconnect");
+  const ok = await confirmAction(
+    "Disconnect?",
+    "This ends your session: the bot stops, unfilled orders are cancelled, and your markets, rules and results here are cleared. Contracts you already bought stay in your Public account.",
+    "Disconnect",
+  );
   if (!ok) return;
-  try {
-    await api("POST", "/api/disconnect", { forget_key: false });
-    await boot();
-  } catch (err) {
-    toast(err.message, true);
-  }
+  await endSession();
+  showOnboarding("welcome");
 });
 
 // --- strategy dialog ------------------------------------------------------------
@@ -900,9 +1045,8 @@ $("#market-search").addEventListener("input", renderAvailable);
 $("#available-list").addEventListener("click", async (e) => {
   const series = e.target.closest("[data-add]")?.dataset.add;
   if (!series) return;
-  const m = available.find((a) => a.series === series);
   try {
-    setState(await api("POST", "/api/markets", { series, name: m.name, category: m.category }));
+    setState(await api("POST", "/api/markets", { series }));
     renderAvailable();
   } catch (err) {
     toast(err.message, true);

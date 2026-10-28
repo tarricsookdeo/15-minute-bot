@@ -3,7 +3,15 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from fifteen_bot.strategy import Quote, Strategy, in_entry_window, pick_contract, settle_pnl
+from fifteen_bot.strategy import (
+    Quote,
+    Strategy,
+    exit_reason,
+    in_entry_window,
+    pick_contract,
+    sell_price,
+    settle_pnl,
+)
 
 D = Decimal
 
@@ -82,3 +90,43 @@ def test_invalid_strategies_are_rejected(kwargs):
 def test_settle_pnl():
     assert settle_pnl(D("10"), D("0.85"), D("0.20"), won=True) == D("1.30")
     assert settle_pnl(D("10"), D("0.85"), D("0.20"), won=False) == D("-8.70")
+
+
+def test_settle_pnl_with_contracts_sold_early():
+    # 10 bought @ 0.85 with 0.20 fees; 4 sold for 3.80 after fees, 6 held to settlement.
+    assert settle_pnl(D("10"), D("0.85"), D("0.20"), True, D("4"), D("3.80")) == D("1.10")
+    assert settle_pnl(D("10"), D("0.85"), D("0.20"), False, D("4"), D("3.80")) == D("-4.90")
+    # Fully sold: settlement outcome no longer matters.
+    assert settle_pnl(D("10"), D("0.85"), D("0.20"), False, D("10"), D("9.10")) == D("0.40")
+
+
+def test_exit_targets_are_optional_and_whole_cents():
+    assert Strategy().take_profit is None and Strategy().stop_loss is None
+    s = Strategy(take_profit="0.05", stop_loss="0.10")
+    assert (s.take_profit, s.stop_loss) == (D("0.05"), D("0.10"))
+    for bad in ({"take_profit": "0.055"}, {"stop_loss": "0"}, {"take_profit": "0.99"}):
+        with pytest.raises(ValidationError):
+            Strategy(**bad)
+
+
+def test_sell_price_rounds_the_bid_down():
+    assert sell_price(D("0.917")) == D("0.91") and sell_price(D("0.90")) == D("0.90")
+
+
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [
+        ("0.92", None),  # +4c after fees: below the 5c target
+        ("0.93", "TAKE_PROFIT"),  # 0.93 - 0.01 fee - 0.87 = +5c
+        ("0.80", None),  # -8c
+        ("0.79", "STOP_LOSS"),  # 0.79 - 0.01 - 0.87 = -9c, past the 9c stop
+    ],
+)
+def test_exit_reason_compares_profit_after_fees(price, expected):
+    s = Strategy(take_profit="0.05", stop_loss="0.09")
+    assert exit_reason(s, cost_per_contract=D("0.87"), price=D(price), sell_fee_per_contract=D("0.01")) == expected
+
+
+def test_no_targets_never_exit():
+    assert exit_reason(Strategy(), D("0.87"), D("0.99"), D("0")) is None
+    assert exit_reason(Strategy(), D("0.87"), D("0.01"), D("0")) is None

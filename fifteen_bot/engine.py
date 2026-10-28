@@ -13,7 +13,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
 import httpx
@@ -29,16 +29,32 @@ from public_api_sdk import (
     EventSummaryFilters,
     EventSummaryRequest,
     InstrumentType,
+    OrderExpirationRequest,
     OrderInstrument,
+    OrderRequest,
     OrderSearchRequest,
+    OrderSide,
     OrderStatus,
+    OrderType,
     QuoteOutcome,
+    TimeInForce,
 )
 from public_api_sdk.models.account import Account
 
 from .ratelimit import MAX_REQUESTS_PER_SECOND, RateLimitedTransport, RateLimiter, urgent
 from .store import Store, now_iso
-from .strategy import CENT, Pick, Quote, Strategy, in_entry_window, pick_contract, settle_pnl
+from .strategy import (
+    CENT,
+    ExitReason,
+    Pick,
+    Quote,
+    Strategy,
+    exit_reason,
+    in_entry_window,
+    pick_contract,
+    sell_price,
+    settle_pnl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +70,7 @@ HOT_MARGIN_SECONDS = 10
 SETTLE_GRACE_SECONDS = 30  # windows settle a few minutes after they close
 SETTLE_POLL_SECONDS = 20.0
 ORDER_LOOKUP_GRACE_SECONDS = 30
+EXIT_RETRY_SECONDS = 5.0  # a sell not filled by then is cancelled and re-priced at the new bid
 
 TERMINAL_ORDER_STATUSES = {
     OrderStatus.FILLED.value,
@@ -63,6 +80,10 @@ TERMINAL_ORDER_STATUSES = {
     OrderStatus.EXPIRED.value,
     OrderStatus.REPLACED.value,
 }
+# A sell that Public rejected or never created is done too; the position is then held to settlement.
+# NOT_SENT: it couldn't be saved first, so it was never sent; a later tick can try again.
+EXIT_DONE_STATUSES = TERMINAL_ORDER_STATUSES | {"NOT_FOUND", "NOT_SENT"}
+EXIT_LABELS = {"TAKE_PROFIT": "take-profit", "STOP_LOSS": "stop-loss"}
 
 
 def utcnow() -> datetime:
@@ -121,8 +142,9 @@ class Window:
 
 
 class Engine:
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, label: str = "") -> None:
         self.store = store
+        self.label = label  # identifies the session in server logs
         self.client: Optional[AsyncPublicApiClient] = None
         self.accounts: list[Account] = []
         self.account_id: Optional[str] = None
@@ -131,16 +153,22 @@ class Engine:
         self.available: list[dict[str, Any]] = []
         self.log: deque[dict[str, Any]] = deque(maxlen=300)
         self._http: Optional[httpx.AsyncClient] = None
+        self._transport: Optional[RateLimitedTransport] = None
         self._events_at = float("-inf")
         self._quotes_at = float("-inf")
         self._settle_checked: dict[int, float] = {}
-        self._cancel_sent: set[int] = set()
+        self._cancel_sent: set[int] = set()  # trade ids whose buy order was cancelled
+        self._exit_cancel_sent: set[int] = set()  # exit ids whose sell order was cancelled
+        # Awaited after recording an order and before sending it; with a database, this saves
+        # the record first, so a crash can never leave an order at Public that we don't know about.
+        self.checkpoint: Callable[[], Awaitable[None]] = _nothing
 
     # --- session ----------------------------------------------------------
 
     async def connect(self, api_key: str) -> list[Account]:
         """Validate the key by listing accounts; raises APIError if Public rejects it."""
-        http = _rate_limited_http_client()
+        transport = RateLimitedTransport(RateLimiter(MAX_REQUESTS_PER_SECOND))
+        http = _rate_limited_http_client(transport)
         client = AsyncPublicApiClient(
             ApiKeyAuthConfig(api_secret_key=api_key, validity_minutes=60), http_client=http
         )
@@ -151,14 +179,20 @@ class Engine:
             await http.aclose()
             raise
         await self.disconnect()
-        self.client, self._http, self.accounts = client, http, accounts
-        saved = self.store.get_setting("account_id")
-        if any(a.account_id == saved for a in accounts):
-            self.account_id = saved
-        elif len(accounts) == 1:
+        self.client, self._http, self._transport, self.accounts = client, http, transport, accounts
+        if len(accounts) == 1:
             self.select_account(accounts[0].account_id)
         self._log("info", None, f"Connected to Public ({len(accounts)} account(s))")
         return accounts
+
+    async def resume(self, api_key: str) -> None:
+        """Reconnect a session saved before a server restart, to the account and running state it had."""
+        await self.connect(api_key)
+        saved = self.store.get_setting("account_id")
+        if saved and any(a.account_id == saved for a in self.accounts):
+            self.account_id = saved
+        self.running = self.account_id is not None and self.store.get_setting("running") == "1"
+        self._log("info", None, f"Resumed after a server restart{', still trading' if self.running else ''}")
 
     def select_account(self, account_id: str) -> None:
         if not any(a.account_id == account_id for a in self.accounts):
@@ -169,7 +203,7 @@ class Engine:
     async def disconnect(self) -> None:
         self.running = False
         client, self.client, self.accounts, self.account_id = self.client, None, [], None
-        http, self._http = self._http, None
+        http, self._http, self._transport = self._http, None, None
         self.windows.clear()
         self.available = []
         self._events_at = self._quotes_at = float("-inf")
@@ -179,7 +213,32 @@ class Engine:
             if http is not None:
                 await http.aclose()
         except Exception:
-            logger.exception("closing the Public client failed")
+            logger.exception("%sclosing the Public client failed", self._prefix)
+
+    async def shutdown(self) -> None:
+        """End of a session: cancel orders still waiting to fill, then disconnect.
+
+        Contracts that already filled stay in the account and settle at Public as normal.
+        """
+        if self.client is not None and self.account_id is not None:
+            for trade in self.store.trades_to_track():
+                open_orders = [trade] if trade["order_status"] not in TERMINAL_ORDER_STATUSES else []
+                open_orders += [e for e in self.store.exits_for(trade["id"]) if e["order_status"] not in EXIT_DONE_STATUSES]
+                for order in open_orders:
+                    if not order["order_id"]:
+                        continue
+                    try:
+                        with urgent():
+                            await self.client.cancel_order(order["order_id"], self.account_id)
+                        self._log("info", trade["series"], f"Cancelled unfilled order for trade #{trade['id']} at session end")
+                    except Exception:
+                        logger.exception("%scancelling order %s at shutdown failed", self._prefix, order["order_id"])
+        await self.disconnect()
+
+    def key_refused_seconds(self) -> float:
+        """How long Public has been refusing this session's key; 0 while it's accepted."""
+        since = self._transport.refused_since if self._transport else None
+        return time.monotonic() - since if since is not None else 0.0
 
     def set_running(self, running: bool) -> None:
         if running and (self.client is None or self.account_id is None):
@@ -187,6 +246,7 @@ class Engine:
         if running != self.running:
             self.running = running
             self._log("info", None, f"Engine {'started' if running else 'stopped'}")
+        self.store.set_setting("running", "1" if running else "0")
 
     # --- loop -------------------------------------------------------------
 
@@ -196,7 +256,7 @@ class Engine:
             try:
                 await self._tick()
             except Exception as exc:  # keep the loop alive whatever happens
-                logger.exception("tick failed")
+                logger.exception("%stick failed", self._prefix)
                 self._log("error", None, f"Engine error: {exc}")
             await asyncio.sleep(max(0.5, TICK_SECONDS - (time.monotonic() - started)))
 
@@ -216,13 +276,14 @@ class Engine:
         await self._guarded(None, self._refresh_quotes(live))
         # Concurrent so markets entering together don't wait on each other; the rate limiter paces them.
         await asyncio.gather(*(self._guarded(m["series"], self._decide(m, w)) for m, w in live))
+        await asyncio.gather(*(self._guarded(m["series"], self._manage_exit(m, w)) for m, w in live))
         await self._track_trades()
 
     async def _guarded(self, series: Optional[str], step) -> None:
         try:
             await step
         except Exception as exc:
-            logger.exception("step failed for %s", series)
+            logger.exception("%sstep failed for %s", self._prefix, series)
             self._log("error", series, str(exc))
 
     # --- discovery --------------------------------------------------------
@@ -406,6 +467,12 @@ class Engine:
         order_id = str(uuid4())
         trade_id = self.store.insert_trade(**trade, order_id=order_id, order_status="SUBMITTING")
         try:
+            await self.checkpoint()
+        except Exception as exc:
+            self.store.update_trade(trade_id, order_status="NOT_SENT", result="ERROR", note="Couldn't save the order")
+            self._log("error", series, f"Didn't send {summary}: couldn't save it first ({exc})")
+            return
+        try:
             await self.client.buy_event_contract(
                 pick.symbol, quantity, limit_price=pick.price, order_id=order_id, account_id=self.account_id
             )
@@ -418,25 +485,142 @@ class Engine:
         window.note = f"Ordered {summary}"
         self._log("trade", series, f"Ordered {summary}")
 
+    # --- early exits ------------------------------------------------------
+
+    async def _manage_exit(self, market: dict[str, Any], window: Window) -> None:
+        """Sell this window's position early once its take-profit or stop-loss is reached."""
+        strategy: Strategy = market["strategy"]
+        if not (self.running and market["enabled"]) or (strategy.take_profit is None and strategy.stop_loss is None):
+            return
+        trade = self.store.trade_for(market["series"], window.event_symbol)
+        if trade is None or trade["result"] != "PENDING":
+            return
+        assert self.client is not None and self.account_id is not None
+        filled = Decimal(trade["filled_quantity"])
+        held = filled - Decimal(trade["sold_quantity"])
+        if held <= 0:
+            return
+        exits = self.store.exits_for(trade["id"])
+        if any(e["order_status"] in ("REJECTED", "NOT_FOUND") for e in exits):
+            return  # Public refused a sell; already logged, and retrying would just repeat it
+        pending = [e for e in exits if e["order_status"] not in EXIT_DONE_STATUSES]
+        if pending:
+            for e in pending:
+                age = (utcnow() - datetime.fromisoformat(e["placed_at"])).total_seconds()
+                sent = e["order_status"] not in ("SUBMITTING", "SUBMIT_ERROR")
+                if sent and age >= EXIT_RETRY_SECONDS and e["id"] not in self._exit_cancel_sent:
+                    # The bid moved away; once Public confirms the cancel, a later tick re-prices.
+                    await self._cancel_exit(e)
+            return
+
+        if not window.tradable or time.monotonic() - window.priced_at > MAX_QUOTE_AGE_SECONDS:
+            return
+        bid = window.yes_bid if trade["side"] == "YES" else window.no_bid
+        if bid is None or (price := sell_price(bid)) < CENT:
+            return
+        quantity = Decimal(trade["quantity"])
+        buy_fees = Decimal(trade["est_fees"]) * filled / quantity
+        cost = Decimal(trade["avg_price"] or trade["limit_price"]) + buy_fees / filled
+        # Selling costs about what buying did; Public quotes no fee for a sell before it's placed.
+        sell_fee = Decimal(trade["est_fees"]) / quantity
+        reason = exit_reason(strategy, cost, price, sell_fee)
+        if reason is None:
+            return
+        if trade["order_status"] not in TERMINAL_ORDER_STATUSES:
+            # Stop the rest of the buy first so nothing fills after the sell; then sell what filled.
+            if trade["id"] not in self._cancel_sent:
+                with urgent():
+                    await self.client.cancel_order(trade["order_id"], self.account_id)
+                self._cancel_sent.add(trade["id"])
+            return
+        with urgent():
+            await self._sell(trade, held, price, reason, sell_fee)
+
+    async def _sell(self, trade: dict[str, Any], quantity: Decimal, price: Decimal, reason: ExitReason, fee: Decimal) -> None:
+        assert self.client is not None
+        series = trade["series"]
+        summary = f"{trade['side']} x{quantity} @ {_cents(price)} ({EXIT_LABELS[reason]})"
+        # Recorded before sending, like buys, so a timeout can never lead to a second sell.
+        order_id = str(uuid4())
+        exit_id = self.store.insert_exit(
+            trade_id=trade["id"], reason=reason, quantity=quantity, limit_price=price,
+            est_fees=fee * quantity, order_id=order_id, order_status="SUBMITTING",
+        )
+        if trade["exit_reason"] is None:
+            self.store.update_trade(trade["id"], exit_reason=reason)
+        try:
+            await self.checkpoint()
+        except Exception as exc:
+            self.store.update_exit(exit_id, order_status="NOT_SENT", note="Couldn't save the order")
+            self._log("error", series, f"Didn't send sell {summary}: couldn't save it first ({exc})")
+            return
+        try:
+            await self.client.place_order(_sell_order(trade["contract_symbol"], quantity, price, order_id), self.account_id)
+        except APIError as exc:
+            # The request may still have reached Public; order tracking looks it up either way.
+            self.store.update_exit(exit_id, order_status="SUBMIT_ERROR", note=str(exc))
+            self._log("error", series, f"Sell failed {summary}: {exc}")
+            return
+        self.store.update_exit(exit_id, order_status=OrderStatus.NEW.value)
+        self._log("trade", series, f"Selling {summary}")
+
+    async def _cancel_exit(self, exit: dict[str, Any]) -> None:
+        assert self.client is not None
+        self._exit_cancel_sent.add(exit["id"])
+        try:
+            with urgent():
+                await self.client.cancel_order(exit["order_id"], self.account_id)
+        except APIError as exc:
+            # Usually the sell filled in the meantime; order tracking records whatever happened.
+            logger.info("%scancelling sell %s: %s", self._prefix, exit["order_id"], exc)
+
+    def _sync_sold(self, trade_id: int) -> None:
+        """Total up a trade's sell orders onto the trade, for P/L and the dashboard."""
+        sold = value = fees = Decimal(0)
+        for e in self.store.exits_for(trade_id):
+            filled = Decimal(e["filled_quantity"])
+            if filled > 0:
+                sold += filled
+                value += filled * Decimal(e["avg_price"] or e["limit_price"])
+                fees += Decimal(e["est_fees"]) * filled / Decimal(e["quantity"])
+        self.store.update_trade(trade_id, sold_quantity=sold, sold_value=value, sell_fees=fees)
+
     # --- order tracking and settlement -----------------------------------
 
     async def _track_trades(self) -> None:
         trades = self.store.trades_to_track()
         open_orders = [t for t in trades if t["order_status"] not in TERMINAL_ORDER_STATUSES]
-        if open_orders:
-            await self._guarded(None, self._track_orders(open_orders))
+        open_exits = [
+            (e, t) for t in trades for e in self.store.exits_for(t["id"]) if e["order_status"] not in EXIT_DONE_STATUSES
+        ]
+        if open_orders or open_exits:
+            await self._guarded(None, self._track_orders(open_orders, open_exits))
         for trade in trades:
             if trade["order_status"] in TERMINAL_ORDER_STATUSES:
                 await self._guarded(trade["series"], self._check_settlement(trade))
 
-    async def _track_orders(self, trades: list[dict[str, Any]]) -> None:
-        """Look up every open order with one search rather than one request per order."""
+    async def _track_orders(
+        self, trades: list[dict[str, Any]], exits: list[tuple[dict[str, Any], dict[str, Any]]]
+    ) -> None:
+        """Look up every open order (buys and sells) with one search rather than one request per order."""
         assert self.client is not None and self.account_id is not None
-        since = min(datetime.fromisoformat(t["placed_at"]) for t in trades) - timedelta(minutes=1)
+        placed = [t["placed_at"] for t in trades] + [e["placed_at"] for e, _ in exits]
+        since = min(datetime.fromisoformat(p) for p in placed) - timedelta(minutes=1)
         found = await self.client.search_orders(
             OrderSearchRequest(created_after=since, security_type=InstrumentType.EVENTCONTRACT), self.account_id
         )
         orders = {order.order_id: order for order in found}
+        for exit, trade in exits:
+            order = orders.get(exit["order_id"])
+            self._track_exit(exit, trade, order)
+            if (
+                order is not None
+                and order.status.value not in EXIT_DONE_STATUSES
+                and exit["id"] not in self._exit_cancel_sent
+                and utcnow() >= datetime.fromisoformat(trade["close_time"])
+            ):
+                # The window is over; Public settles whatever is still held.
+                await self._cancel_exit(exit)
         for trade in trades:
             trade_id = trade["id"]
             order = orders.get(trade["order_id"])
@@ -465,8 +649,44 @@ class Engine:
             if status != trade["order_status"]:
                 self._log("info", trade["series"], f"Order #{trade_id} {status.lower()} ({filled} filled)")
 
+    def _track_exit(self, exit: dict[str, Any], trade: dict[str, Any], order: Any) -> None:
+        series = trade["series"]
+        if order is None:
+            placed = datetime.fromisoformat(exit["placed_at"])
+            if utcnow() - placed > timedelta(seconds=ORDER_LOOKUP_GRACE_SECONDS):
+                self.store.update_exit(exit["id"], order_status="NOT_FOUND")
+                self._log("error", series, f"Sell for trade #{trade['id']} was never created; holding to settlement")
+            return
+        status = order.status.value
+        filled = order.filled_quantity or Decimal(0)
+        fields: dict[str, Any] = {"order_status": status, "filled_quantity": filled}
+        if order.average_price is not None:
+            fields["avg_price"] = order.average_price
+        if order.reject_reason:
+            fields["note"] = order.reject_reason
+        self.store.update_exit(exit["id"], **fields)
+        self._sync_sold(trade["id"])
+        if status == exit["order_status"]:
+            return
+        if status == OrderStatus.REJECTED.value:
+            self._log("error", series, f"Sell for trade #{trade['id']} rejected ({order.reject_reason or 'no reason given'}); holding to settlement")
+        elif status == OrderStatus.FILLED.value:
+            self._log("trade", series, f"Sold {trade['side']} x{filled} @ {_cents(order.average_price or Decimal(exit['limit_price']))}")
+        elif status in TERMINAL_ORDER_STATUSES and filled > 0:
+            self._log("info", series, f"Sell for trade #{trade['id']} {status.lower()} with {filled} sold")
+
     async def _check_settlement(self, trade: dict[str, Any]) -> None:
         assert self.client is not None
+        filled = Decimal(trade["filled_quantity"])
+        sold = Decimal(trade["sold_quantity"])
+        buy_fees = Decimal(trade["est_fees"]) * filled / Decimal(trade["quantity"])
+        proceeds = Decimal(trade["sold_value"]) - Decimal(trade["sell_fees"])
+        if filled > 0 and sold >= filled:
+            # Sold out of the whole position early: final now, no need to wait for the window to settle.
+            pnl = settle_pnl(filled, Decimal(trade["avg_price"]), buy_fees, False, sold, proceeds).quantize(Decimal("0.0001"))
+            self.store.update_trade(trade["id"], result="SOLD", pnl=pnl, settled_at=now_iso())
+            self._log("result", trade["series"], f"{trade['side']} sold early: {'+' if pnl >= 0 else '-'}${abs(pnl):.2f}")
+            return
         close_time = datetime.fromisoformat(trade["close_time"])
         if utcnow() < close_time + timedelta(seconds=SETTLE_GRACE_SECONDS):
             return
@@ -474,15 +694,15 @@ class Engine:
             return
         self._settle_checked[trade["id"]] = time.monotonic()
 
-        filled = Decimal(trade["filled_quantity"])
         if filled == 0:
             self.store.update_trade(trade["id"], result="UNFILLED", pnl=Decimal(0), settled_at=now_iso())
             return
+        if any(e["order_status"] not in EXIT_DONE_STATUSES for e in self.store.exits_for(trade["id"])):
+            return  # a sell is still being cancelled; settle once its final fill is known
         outcome = (await self.client.get_event_details(trade["event_symbol"])).outcome
         if outcome is None or outcome.state != EventOutcomeState.STATE_SETTLED:
             return
 
-        fees = Decimal(trade["est_fees"]) * filled / Decimal(trade["quantity"])
         won = outcome.won(trade["contract_symbol"])
         if won is None:
             self.store.update_trade(
@@ -490,7 +710,7 @@ class Engine:
             )
             self._log("warn", trade["series"], f"Trade #{trade['id']} settled without a YES/NO winner")
             return
-        pnl = settle_pnl(filled, Decimal(trade["avg_price"]), fees, won).quantize(Decimal("0.0001"))
+        pnl = settle_pnl(filled, Decimal(trade["avg_price"]), buy_fees, won, sold, proceeds).quantize(Decimal("0.0001"))
         self.store.update_trade(trade["id"], result="WON" if won else "LOST", pnl=pnl, settled_at=now_iso())
         self._settle_checked.pop(trade["id"], None)
         verb = "won" if won else "lost"
@@ -508,7 +728,10 @@ class Engine:
             if window and window.closes_at <= utcnow():
                 window = None
             trade = self.store.open_trade(market["series"])
-            position = _position(trade, window) if trade else None
+            position = None
+            if trade:
+                selling = any(e["order_status"] not in EXIT_DONE_STATUSES for e in self.store.exits_for(trade["id"]))
+                position = _position(trade, window, selling)
             if position and position["pnl"] is not None:
                 open_pnl = (open_pnl or Decimal(0)) + position["pnl"]
             this_window = self.store.trade_for(market["series"], window.event_symbol) if window else None
@@ -537,31 +760,42 @@ class Engine:
             "server_time": utcnow().isoformat(),
         }
 
+    @property
+    def _prefix(self) -> str:
+        return f"<{self.label}> " if self.label else ""
+
     def _log(self, level: str, series: Optional[str], message: str) -> None:
         log = logger.warning if level in ("warn", "error") else logger.info
-        log("%s%s", f"[{series}] " if series else "", message)
+        log("%s%s%s", self._prefix, f"[{series}] " if series else "", message)
         self.log.append({"time": now_iso(), "level": level, "series": series, "message": message})
 
 
-def _position(trade: dict[str, Any], window: Optional[Window]) -> dict[str, Any]:
+def _position(trade: dict[str, Any], window: Optional[Window], selling: bool = False) -> dict[str, Any]:
     """A market's unsettled trade, valued at the current bid while its window is still trading.
 
-    The bid is what the contracts could be sold for right now, so `pnl` is what
-    you'd make or lose by selling (before any selling fee). Once the window
-    closes there's no market to price against until Public settles it.
+    The bid is what the contracts still held could be sold for right now, so `pnl`
+    is what you'd make or lose by selling them (before any selling fee), plus what
+    any contracts already sold early brought in. Once the window closes there's no
+    market to price against until Public settles it.
     """
     filled = Decimal(trade["filled_quantity"])
     quantity = Decimal(trade["quantity"])
+    sold = Decimal(trade.get("sold_quantity") or 0)
+    held = filled - sold
+    proceeds = Decimal(trade.get("sold_value") or 0) - Decimal(trade.get("sell_fees") or 0)
     avg_price = Decimal(trade["avg_price"] or trade["limit_price"])
     fees = Decimal(trade["est_fees"]) * filled / quantity
     cost = filled * avg_price + fees
     trading = window is not None and window.event_symbol == trade["event_symbol"]
     bid = (window.yes_bid if trade["side"] == "YES" else window.no_bid) if trading else None  # type: ignore[union-attr]
-    value = filled * bid if bid is not None and filled > 0 else None
+    value = held * bid + proceeds if bid is not None and filled > 0 else None
     return {
         "side": trade["side"],
         "quantity": quantity,
         "filled": filled,
+        "sold": sold,
+        "selling": selling,
+        "exit_reason": trade.get("exit_reason"),
         "avg_price": avg_price,
         "order_open": trade["order_status"] not in TERMINAL_ORDER_STATUSES,
         "trading": trading,
@@ -569,8 +803,8 @@ def _position(trade: dict[str, Any], window: Optional[Window]) -> dict[str, Any]
         "bid": bid,
         "value": value,
         "pnl": value - cost if value is not None else None,
-        "if_win": filled - cost,
-        "if_lose": -cost,
+        "if_win": held + proceeds - cost,
+        "if_lose": proceeds - cost,
     }
 
 
@@ -581,12 +815,31 @@ def _trade_summary(trade: dict[str, Any]) -> dict[str, Any]:
         "quantity": Decimal(trade["quantity"]),
         "filled": Decimal(trade["filled_quantity"]),
         "price": Decimal(trade["avg_price"] or trade["limit_price"]),
+        "sold": Decimal(trade["sold_quantity"]),
+        "exit_reason": trade["exit_reason"],
         "result": trade["result"],
         "note": trade["note"],
     }
 
 
-def _rate_limited_http_client() -> httpx.AsyncClient:
+async def _nothing() -> None:
+    pass
+
+
+def _sell_order(symbol: str, quantity: Decimal, price: Decimal, order_id: str) -> OrderRequest:
+    """A DAY limit sell of contracts already held (the SDK only has a helper for buying)."""
+    return OrderRequest(
+        order_id=order_id,
+        instrument=OrderInstrument(symbol=symbol, type=InstrumentType.EVENTCONTRACT),
+        order_side=OrderSide.SELL,
+        order_type=OrderType.LIMIT,
+        limit_price=price,
+        quantity=quantity,
+        expiration=OrderExpirationRequest(time_in_force=TimeInForce.DAY),
+    )
+
+
+def _rate_limited_http_client(transport: RateLimitedTransport) -> httpx.AsyncClient:
     """The HTTP client the SDK would build itself, with every request passing the rate limiter."""
     version = getattr(public_api_sdk, "__version__", "0.1.0")
     return httpx.AsyncClient(
@@ -595,8 +848,9 @@ def _rate_limited_http_client() -> httpx.AsyncClient:
             "User-Agent": f"public-python-api-sdk-{version}",
             "X-App-Version": f"public-python-api-sdk-{version}",
         },
-        timeout=30.0,
-        transport=RateLimitedTransport(RateLimiter(MAX_REQUESTS_PER_SECOND)),
+        # Short enough that one slow request can't make the bot miss a buy window.
+        timeout=10.0,
+        transport=transport,
     )
 
 

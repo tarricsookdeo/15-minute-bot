@@ -1,14 +1,16 @@
-"""SQLite persistence for selected markets, settings and trades.
+"""One user's markets, settings and trades, in an in-memory SQLite database.
 
-All access happens on the asyncio event-loop thread, so one connection is enough.
+Each session gets its own Store, which the engine reads and writes. On its own it
+disappears with the session; with a database configured, `persist` copies every
+change through `listener`, and `load` restores a session after a restart. All
+access happens on the asyncio event-loop thread, so one connection is enough.
 """
 
 import json
 import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 from .strategy import Strategy
 
@@ -45,13 +47,40 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl TEXT,
     settled_at TEXT,
     note TEXT,
+    -- totals of the sell orders in `exits`, kept here for the dashboard and P/L
+    exit_reason TEXT,
+    sold_quantity TEXT NOT NULL DEFAULT '0',
+    sold_value TEXT NOT NULL DEFAULT '0',
+    sell_fees TEXT NOT NULL DEFAULT '0',
     -- one entry per market per 15-minute window
     UNIQUE (series, event_symbol)
 );
+-- Sell orders that close a trade's position early (take-profit or stop-loss). One trade
+-- can have several: a sell that doesn't fill quickly is cancelled and re-priced.
+CREATE TABLE IF NOT EXISTS exits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id INTEGER NOT NULL REFERENCES trades (id),
+    reason TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    limit_price TEXT NOT NULL,
+    filled_quantity TEXT NOT NULL DEFAULT '0',
+    avg_price TEXT,
+    est_fees TEXT NOT NULL DEFAULT '0',
+    order_id TEXT NOT NULL,
+    order_status TEXT NOT NULL,
+    placed_at TEXT NOT NULL,
+    note TEXT
+);
 """
 
+# Each table's primary key, which identifies a row to the listener.
+TABLE_KEYS = {"settings": "key", "markets": "series", "trades": "id", "exits": "id"}
+
+# Called with (table, row key, row) after a row changes; the row is None once deleted.
+Listener = Callable[[str, str, Optional[dict[str, Any]]], None]
+
 # Results that are final; everything else is still being tracked.
-FINAL_RESULTS = ("WON", "LOST", "VOID", "UNFILLED", "REJECTED", "ERROR")
+FINAL_RESULTS = ("WON", "LOST", "SOLD", "VOID", "UNFILLED", "REJECTED", "ERROR")
 
 
 def now_iso() -> str:
@@ -59,21 +88,54 @@ def now_iso() -> str:
 
 
 class Store:
-    def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, check_same_thread=False)
+    def __init__(self) -> None:
+        self.db = sqlite3.connect(":memory:", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        self._drop_paper_trading()
         self.db.commit()
+        self.listener: Optional[Listener] = None
+        self._reported: dict[tuple[str, str], Optional[dict[str, Any]]] = {}
 
-    def _drop_paper_trading(self) -> None:
-        """Databases from before paper mode was removed: drop simulated trades and the mode column."""
-        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(trades)")}
-        if "mode" in columns:
-            self.db.execute("DELETE FROM trades WHERE mode != 'LIVE'")
-            self.db.execute("ALTER TABLE trades DROP COLUMN mode")
-        self.db.execute("DELETE FROM settings WHERE key = 'mode'")
+    def close(self) -> None:
+        self.db.close()
+
+    def _changed(self, table: str, key: Any) -> None:
+        """Tell the listener about a row's new state, unless it's the same as last time."""
+        if self.listener is None:
+            return
+        row = self.db.execute(f"SELECT * FROM {table} WHERE {TABLE_KEYS[table]} = ?", (key,)).fetchone()
+        data = dict(row) if row else None
+        if self._reported.get((table, str(key))) != data:
+            self._reported[(table, str(key))] = data
+            self.listener(table, str(key), data)
+
+    def watch(self, listener: Listener) -> None:
+        """Report every row now, then each change from here on."""
+        self.listener = listener
+        for table, key, row in self.dump():
+            self._reported[(table, key)] = row
+            listener(table, key, row)
+
+    def dump(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
+        """Every row, as (table, row key, row)."""
+        for table, key in TABLE_KEYS.items():
+            for row in self.db.execute(f"SELECT * FROM {table}").fetchall():
+                yield table, str(row[key]), dict(row)
+
+    def load(self, rows: Iterable[tuple[str, dict[str, Any]]]) -> None:
+        """Restore rows from `dump` or the listener, e.g. after a restart.
+
+        Columns this version doesn't have are dropped, and ones it added take their defaults.
+        """
+        columns = {t: {c["name"] for c in self.db.execute(f"PRAGMA table_info({t})")} for t in TABLE_KEYS}
+        for table, row in rows:
+            if table not in TABLE_KEYS:
+                continue
+            fields = {name: value for name, value in row.items() if name in columns[table]}
+            names = ", ".join(fields)
+            marks = ", ".join("?" for _ in fields)
+            self.db.execute(f"INSERT OR REPLACE INTO {table} ({names}) VALUES ({marks})", list(fields.values()))
+        self.db.commit()
 
     # --- settings ---------------------------------------------------------
 
@@ -91,6 +153,7 @@ class Store:
                 (key, value),
             )
         self.db.commit()
+        self._changed("settings", key)
 
     # --- markets ----------------------------------------------------------
 
@@ -109,10 +172,12 @@ class Store:
             (series, name, category, Strategy().model_dump_json(), now_iso()),
         )
         self.db.commit()
+        self._changed("markets", series)
 
     def remove_market(self, series: str) -> None:
         self.db.execute("DELETE FROM markets WHERE series = ?", (series,))
         self.db.commit()
+        self._changed("markets", series)
 
     def update_market(
         self, series: str, *, enabled: Optional[bool] = None, strategy: Optional[Strategy] = None
@@ -124,6 +189,7 @@ class Store:
                 "UPDATE markets SET strategy = ? WHERE series = ?", (strategy.model_dump_json(), series)
             )
         self.db.commit()
+        self._changed("markets", series)
 
     @staticmethod
     def _market(row: sqlite3.Row) -> dict[str, Any]:
@@ -148,6 +214,7 @@ class Store:
             f"INSERT INTO trades ({columns}) VALUES ({marks})", [_db(v) for v in fields.values()]
         )
         self.db.commit()
+        self._changed("trades", cursor.lastrowid)
         return int(cursor.lastrowid)
 
     def update_trade(self, trade_id: int, **fields: Any) -> None:
@@ -156,6 +223,34 @@ class Store:
             f"UPDATE trades SET {assignments} WHERE id = ?", [*(_db(v) for v in fields.values()), trade_id]
         )
         self.db.commit()
+        self._changed("trades", trade_id)
+
+    # --- exits ------------------------------------------------------------
+
+    def insert_exit(self, **fields: Any) -> int:
+        fields.setdefault("placed_at", now_iso())
+        columns = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        cursor = self.db.execute(
+            f"INSERT INTO exits ({columns}) VALUES ({marks})", [_db(v) for v in fields.values()]
+        )
+        self.db.commit()
+        self._changed("exits", cursor.lastrowid)
+        return int(cursor.lastrowid)
+
+    def update_exit(self, exit_id: int, **fields: Any) -> None:
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        self.db.execute(
+            f"UPDATE exits SET {assignments} WHERE id = ?", [*(_db(v) for v in fields.values()), exit_id]
+        )
+        self.db.commit()
+        self._changed("exits", exit_id)
+
+    def exits_for(self, trade_id: int) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM exits WHERE trade_id = ? ORDER BY id", (trade_id,))
+        return [dict(row) for row in rows.fetchall()]
+
+    # --- trade history ----------------------------------------------------
 
     def trades(self, series: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]]:
         sql = "SELECT * FROM trades"
@@ -200,9 +295,9 @@ class Store:
             if result in ("UNFILLED", "REJECTED", "ERROR"):
                 continue
             s["trades"] += 1
-            if result == "WON":
+            if result == "WON" or (result == "SOLD" and Decimal(row["pnl"]) > 0):
                 s["wins"] += 1
-            elif result == "LOST":
+            elif result in ("LOST", "SOLD"):
                 s["losses"] += 1
             elif result == "PENDING":
                 s["pending"] += 1

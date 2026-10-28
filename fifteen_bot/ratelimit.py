@@ -2,6 +2,7 @@
 
 Every request the SDK makes (logins, token refreshes, retries included) goes through
 one httpx client; `RateLimitedTransport` makes each of them wait for a slot first.
+It also notices when Public starts refusing the key, since it sees every response.
 """
 
 import asyncio
@@ -98,6 +99,7 @@ class RateLimitedTransport(httpx.AsyncBaseTransport):
     def __init__(self, limiter: RateLimiter, transport: Optional[httpx.AsyncBaseTransport] = None) -> None:
         self.limiter = limiter
         self._transport = transport or httpx.AsyncHTTPTransport()
+        self.refused_since: Optional[float] = None  # monotonic; set while Public answers 401
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         await self.limiter.acquire()
@@ -107,6 +109,11 @@ class RateLimitedTransport(httpx.AsyncBaseTransport):
             delay = _retry_after(response.headers.get("Retry-After"))
             logger.warning("Public rate limit hit (429); pausing requests for %.1fs", delay)
             self.limiter.pause(delay)
+        if response.status_code == 401:
+            if self.refused_since is None:
+                self.refused_since = time.monotonic()
+        elif response.status_code < 400:
+            self.refused_since = None
         return response
 
     async def aclose(self) -> None:

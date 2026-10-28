@@ -4,9 +4,10 @@ version = "0.1.0"
 description = "Local dashboard that trades Public.com 15-minute prediction markets with per-market rules"
 requires-python = ">=3.14"
 dependencies = [
+    "cryptography>=50.0.2",
     "fastapi>=0.162.0",
     "httpx>=0.28.1",
-    "keyring>=25.7.0",
+    "psycopg[binary,pool]>=3.3.6",
     "publicdotcom-py>=0.1.27",
     "uvicorn[standard]>=0.54.0",
 ]

@@ -1,0 +1,37 @@
+# DigitalOcean App Platform spec. Deploy with: doctl apps create --spec .do/app.yaml
+# The image is pushed to DigitalOcean Container Registry first (see DEPLOY.md).
+name: fifteen-minute-bot
+region: nyc
+services:
+  - name: web
+    image:
+      registry_type: DOCR
+      repository: fifteen-minute-bot
+      tag: latest
+    http_port: 8080
+    # Must stay at 1: sessions run in this process's memory (saved to the database, and
+    # resumed by the next instance after a deploy). Only one instance can run the bots.
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-1gb-fixed
+    health_check:
+      http_path: /healthz
+    envs:
+      - key: MAX_SESSIONS
+        value: "200"
+      # Saved sessions: bots keep trading through deploys and restarts.
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        value: ${db.DATABASE_URL}
+      # Encrypts stored API keys. The deploy workflow fills this in from the GitHub secret;
+      # App Platform then stores it encrypted.
+      - key: SESSION_ENCRYPTION_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: __SESSION_ENCRYPTION_KEY__
+
+# A DigitalOcean Managed PostgreSQL cluster, created once (see DEPLOY.md).
+databases:
+  - name: db
+    engine: PG
+    production: true
+    cluster_name: fifteen-minute-bot-db

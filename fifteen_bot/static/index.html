@@ -8,7 +8,11 @@
 </head>
 <body>
 
-<!-- Setup wizard (first run) and reconnect screen -->
+<div id="conn-banner" class="banner warn hidden" role="status">
+  Reconnecting to the bot… It keeps running in the meantime.
+</div>
+
+<!-- Setup wizard (each new session) -->
 <div id="onboard-view" class="hidden">
   <div class="onboard">
     <div class="onboard-brand">15-Minute Bot</div>
@@ -28,6 +32,7 @@
       <button id="disconnect-btn" class="btn ghost" type="button">Disconnect</button>
     </div>
   </header>
+  <div class="banner info">The bot keeps trading while this page is closed. Use Stop to pause it, or Disconnect to end it and clear its results.</div>
 
   <main>
     <section class="summary" id="summary"></section>

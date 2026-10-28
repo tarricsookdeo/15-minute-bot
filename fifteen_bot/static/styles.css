@@ -136,6 +136,7 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 .steps-list form { width: 100%; }
 .key-input { display: flex; gap: 8px; }
 .key-input input { flex: 1; }
+#connect-btn { margin-top: 12px; }
 .check { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--muted); margin: 12px 0 14px; }
 
 .faq { margin-top: 12px; font-size: 13px; }
@@ -182,6 +183,10 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 #engine-btn .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; background: var(--muted); }
 #engine-btn.on .dot { background: var(--pos); box-shadow: 0 0 0 3px rgba(47, 191, 113, .25); }
 
+
+.banner { padding: 8px 24px; font-size: 13px; border-bottom: 1px solid var(--border); }
+.banner.info { background: var(--surface-2); color: var(--muted); }
+.banner.warn { background: rgba(242, 169, 59, .14); color: var(--warn); position: sticky; top: 0; z-index: 10; }
 
 main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 60px; display: grid; gap: 28px; }
 .section-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
@@ -246,6 +251,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; t
 tbody tr:last-child td { border-bottom: 0; }
 .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; background: var(--surface-2); color: var(--muted); }
 .pill.WON { background: rgba(47, 191, 113, .15); color: var(--pos); }
+.pill.SOLD { background: rgba(242, 169, 59, .15); color: var(--warn); }
 .pill.LOST, .pill.ERROR, .pill.REJECTED { background: rgba(240, 86, 91, .15); color: var(--neg); }
 .pill.PENDING { background: rgba(76, 141, 255, .15); color: var(--accent); }
 
@@ -288,5 +294,5 @@ dialog::backdrop { background: rgba(0, 0, 0, .55); }
 #toast.error { border-color: var(--neg); color: var(--neg); }
 
 @media (max-width: 640px) {
-  .topbar, main { padding-left: 16px; padding-right: 16px; }
+  .topbar, main, .banner { padding-left: 16px; padding-right: 16px; }
 }

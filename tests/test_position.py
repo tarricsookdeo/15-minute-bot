@@ -57,3 +57,12 @@ def test_a_later_window_does_not_price_an_older_trade():
 
 def test_missing_bid_gives_no_pnl():
     assert _position(trade(), window(yes_bid=None))["pnl"] is None
+
+
+def test_contracts_sold_early_count_at_their_sale_price():
+    # 5 bought: 2 sold for 1.90 gross (0.04 selling fees), 3 still held and valued at the bid.
+    t = trade(sold_quantity="2", sold_value="1.90", sell_fees="0.04", exit_reason="TAKE_PROFIT")
+    p = _position(t, window(yes_bid=D("0.94")), selling=True)
+    assert p["sold"] == D("2") and p["selling"] and p["exit_reason"] == "TAKE_PROFIT"
+    assert p["pnl"] == D("3") * D("0.94") + D("1.86") - D("4.45")
+    assert (p["if_win"], p["if_lose"]) == (D("3") + D("1.86") - D("4.45"), D("1.86") - D("4.45"))
