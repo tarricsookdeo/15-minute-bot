@@ -1,4 +1,4 @@
-"""The hosted API: sessions are required, isolated per user, and responses carry security headers."""
+"""The web API: sessions are required, isolated per user, and responses carry security headers."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -91,7 +91,7 @@ def test_oversized_key_is_rejected_before_reaching_public(client):
 
 def test_while_restarting_the_api_asks_the_page_to_wait(client):
     headers = connect(client, "alice-key")
-    app_module.sessions.ready = False  # a new server waiting to take over from the old one
+    app_module.sessions.ready = False  # waiting for another copy on the same database to stop
     r = client.get("/api/session", headers=headers)
     assert r.status_code == 503 and r.headers["retry-after"] == "2"
     assert client.post("/api/connect", json={"api_key": "bob-key"}).status_code == 503

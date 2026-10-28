@@ -1,20 +1,20 @@
-"""Keeps sessions through restarts and deploys: a durable copy of every session in a database.
+"""Keeps sessions through restarts: a durable copy of every session in a database.
 
 Each session's working data stays in its in-memory Store, which is fast and what
-the engine reads. Every change to it is copied here, so a restarted server loads
-the sessions back and their bots carry on trading.
+the engine reads. Every change to it is copied here, so a restarted app loads the
+sessions back and their bots carry on trading.
 
 - The API key and the session token are encrypted (Fernet, with SESSION_ENCRYPTION_KEY)
   before they're stored; the database never holds them in the clear.
 - Changes are written in batches every half second. The engine calls `flush` before
   it sends an order, so the order is always on record before it can exist at Public:
-  a crash can't make the next server place it a second time.
-- Only one server may run the bots, or two could trade one account. On Postgres a
-  server first waits for an advisory lock, so during a deploy the new server takes
-  over only once the old one has stopped.
+  a crash can't make the next run place it a second time.
+- Only one copy of the app may run the bots, or two could trade one account. Each
+  copy first takes a lock (a lock file next to a SQLite database, an advisory lock on
+  Postgres), so a second copy started on the same database waits until the first stops.
 - Ending a session (Disconnect, idle expiry, a refused key) deletes all of it.
 
-DATABASE_URL picks the database: postgres://… (hosted) or sqlite:///path (local runs, tests).
+DATABASE_URL picks the database: sqlite:///path (a local file) or postgresql://….
 """
 
 import asyncio
@@ -86,7 +86,7 @@ class SavedSession:
 
 
 class Backend:
-    """The database. Subclasses implement storage; locking is a no-op unless several servers could run."""
+    """The database. Subclasses implement storage and the one-copy-at-a-time lock."""
 
     async def open(self) -> None:
         raise NotImplementedError
@@ -95,7 +95,7 @@ class Backend:
         raise NotImplementedError
 
     async def wait_for_lock(self) -> None:
-        """Return once this is the only server running the bots."""
+        """Return once this is the only copy of the app running the bots."""
 
     async def lock_held(self) -> bool:
         return True
@@ -120,11 +120,12 @@ class Backend:
 
 
 class SqliteBackend(Backend):
-    """A local file: sessions survive restarting a local run. One process at a time."""
+    """A local file: sessions survive restarting the app. Locked with `<file>.lock` (macOS, Linux)."""
 
     def __init__(self, path: str) -> None:
         self.path = path
         self.db: Optional[sqlite3.Connection] = None
+        self._lock_file: Optional[Any] = None
 
     async def open(self) -> None:
         self.db = sqlite3.connect(self.path, check_same_thread=False)
@@ -133,9 +134,23 @@ class SqliteBackend(Backend):
         self.db.commit()
 
     async def close(self) -> None:
+        if self._lock_file is not None:
+            self._lock_file.close()  # releases the lock for the next copy
+            self._lock_file = None
         if self.db is not None:
             self.db.close()
             self.db = None
+
+    async def wait_for_lock(self) -> None:
+        import fcntl
+
+        self._lock_file = open(f"{self.path}.lock", "w")
+        while True:
+            try:
+                fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                await asyncio.sleep(1)  # another copy holds it; polling keeps this cancellable
 
     async def load(self):
         assert self.db is not None
@@ -178,7 +193,7 @@ class SqliteBackend(Backend):
 
 
 class PostgresBackend(Backend):
-    """The hosted database. Holds an advisory lock on its own connection for as long as the server runs."""
+    """A Postgres database. Holds an advisory lock on its own connection for as long as the app runs."""
 
     def __init__(self, url: str) -> None:
         self.url = url
@@ -195,7 +210,7 @@ class PostgresBackend(Backend):
 
     async def close(self) -> None:
         if self._lock_conn is not None:
-            await self._lock_conn.close()  # releases the lock for the next server
+            await self._lock_conn.close()  # releases the lock for the next copy
             self._lock_conn = None
         if self._pool is not None:
             await self._pool.close()

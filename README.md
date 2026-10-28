@@ -1,155 +1,188 @@
 # 15-Minute Bot
 
-A web app that trades Public.com's 15-minute prediction markets (BTC, ETH, Gold, EUR/USD, …) using
-rules each user sets per market. Host it once and share the URL: every user connects with their own
-Public API key and gets their own private bot, which keeps trading on the server, through deploys
-and restarts, until they disconnect.
+A trading bot you run on your own computer. It trades Public.com's 15-minute prediction markets
+(BTC, ETH, Gold, EUR/USD, …) using rules you set for each market, and you control it from a
+dashboard in your browser.
 
-> **The bot places real orders with real money.** Nothing is traded until the user presses
-> **Start**, which asks them to confirm first. They can lose the full amount paid for each contract.
+> **The bot places real orders with real money.** Nothing is traded until you press **Start**,
+> which asks you to confirm first. You can lose the full amount you pay for each contract.
 
-## How it works for users
+## Getting started
 
-1. Open the app's URL and follow the setup wizard: paste a Public API key, pick the account,
-   pick markets, set a rule, review, start.
-2. The bot trades on the server, so it **keeps running after the page is closed** or the
-   computer is turned off. The dashboard shows each market's status, live P/L on open positions,
-   results and an activity log, all kept since the bot was started.
-3. **Coming back:** the browser remembers the session (not the key), so reopening the app in the
-   same browser goes straight to the running bot. On another device, pasting the same key rejoins
-   it.
-4. **Deploys and restarts don't interrupt it.** The hosted app saves each session (the key
-   encrypted) in its database, and the next server picks every bot up where it left off: running
-   state, open orders, P/L and history. Users don't need to do anything; the page shows
-   "Reconnecting…" for a few seconds.
-5. **The session ends** when the user clicks **Disconnect**, after a day with the bot stopped and
-   no page open, or if Public stops accepting the key (e.g. it was deleted) for two minutes.
-   Ending it stops the bot, cancels unfilled orders and deletes everything saved for it.
-   Contracts already bought stay in their Public account and settle as normal.
+### 1. What you need
 
-Details users might ask about:
+- **A computer that stays on and awake while the bot trades.** The bot runs inside the app on
+  your computer: it keeps trading with the browser closed, but stops if the app stops or the
+  computer sleeps. It's built and tested on macOS.
+- **A Public.com brokerage account** that can trade prediction markets. If you can buy a 15-minute
+  market (e.g. "BTC 15 min") in Public's own app, you're set.
+- **git**, to download the code (macOS asks to install it the first time you run `git`).
+- **uv**, the Python tool that installs and runs the app. You don't need to install Python yourself;
+  uv downloads the right version the first time.
 
-- **Refreshing the page or a Wi-Fi blip** doesn't end the session; the page reconnects.
-- **A second tab or device** with the same key joins the same bot rather than starting another one.
-- **Stop vs. Disconnect:** **Stop** pauses trading and keeps the results; **Disconnect** ends the
-  session and clears them.
-- **One bot per account:** if an account is already being traded in another session (connected
-  with a different key), it can't be picked until that session ends. Two bots on one account could
-  buy twice in the same window and would share its rate limit.
-- **During a deploy** the bot pauses for a few seconds while the new server takes over. A buy or
-  sell window that falls in that gap can be missed; orders already placed stay open at Public and
-  are tracked by the new server.
-- **Without a database** (`DATABASE_URL` unset, e.g. running locally) nothing is saved, and a
-  restart ends every session: unfilled orders are cancelled and results cleared.
+  ```sh
+  brew install uv                                    # with Homebrew
+  # or
+  curl -LsSf https://astral.sh/uv/install.sh | sh    # without Homebrew
+  ```
 
-### Getting a Public API key
+  Check it worked with `uv --version`.
 
-1. Log in to public.com and open the API settings page: <https://public.com/settings/security/api>.
-   The setup wizard links to it too.
-2. Generate a secret key and copy it.
-
-The account needs to be able to trade prediction markets. If you can buy a 15-minute market (e.g.
-"BTC 15 min") in Public's own app, you're set. Treat the key like a password: anyone who has it can
-trade in the account. If it's ever exposed, delete it on that same page and it stops working
-immediately.
-
-## Security
-
-- **Keys** are used only to talk to Public, and never written to logs or the page. With a database,
-  each key (and session token) is stored **encrypted** with Fernet (AES-128-CBC + HMAC-SHA256)
-  using `SESSION_ENCRYPTION_KEY`, which belongs in your hosting platform's secret store, never in
-  the database or the repository. Ending a session deletes its saved data. Sessions are matched to keys by a
-  SHA-256 hash, not the key itself.
-- **What a leak would mean:** someone with both the database *and* `SESSION_ENCRYPTION_KEY` could
-  trade every connected user's account until they delete their keys at Public. The database alone
-  is useless without the encryption key. Keep the database's network access and wherever the
-  secrets are stored locked down.
-- **Session tokens** are random 256-bit values saved in the browser's `localStorage` (so a
-  returning user skips the key) and sent in an `X-Session` header (or the WebSocket's first
-  message). No cookies, so other websites can't send requests as a user, and tokens never appear in
-  URLs or logs. Anyone using that browser profile can control the bot until **Disconnect** is
-  clicked; deleting the key in Public's API settings also cuts it off.
-- **Isolation:** every API call is scoped to the caller's session; one user can't see or act on
-  another's bot. Account IDs are checked against the user's own accounts before anything else.
-- **Abuse limits:** 10 connection attempts per minute per IP address, 200 sessions per server
-  (`MAX_SESSIONS`), 50 markets per session, and size limits on every request field.
-- **Browser hardening:** strict Content-Security-Policy (no inline or third-party scripts), no
-  framing, `nosniff`, no referrer, HSTS when served over HTTPS. API docs are disabled.
-- **Errors** are logged on the server; users only see a generic message.
-
-## Reliability
-
-- **Each user's bot is independent:** one session's errors can't stop another's.
-- **Public's 10 requests/second limit is per account.** Each session has its own limiter that sends
-  at most 8 per second, evenly spaced, with orders and cancels ahead of routine price checks. If
-  Public still answers 429, that session pauses for the Retry-After time. Prices for all of a
-  user's markets come from one batched request and open orders from one search, so typical use is
-  1–3 requests per second.
-- **Requests time out after 10 seconds**, so one slow response can't make the bot miss a buy window.
-- **The page reconnects automatically** with back-off; the bot keeps trading meanwhile.
-- **Every change is saved** to the database within half a second, and **every order is saved
-  before it's sent**, so after a crash the next server knows about every order that could exist at
-  Public and never places one twice. If the database can't be reached, the bot doesn't send the
-  order.
-- **One server at a time:** a server must hold a Postgres advisory lock before it runs any bot.
-  During a deploy the new server reports healthy but waits ("ready": false in `/healthz`, 503
-  "restarting" to the page) until the old one has stopped and released the lock. If a server ever
-  loses the lock, it shuts itself down so two can never trade one account.
-- **On shutdown** (deploys, restarts) bots are paused and saved, not ended; their orders are left
-  for the next server. Without a database, every session cancels its unfilled orders and ends.
-- **Health check** at `/healthz`; `"ready": true` once the server has taken over and resumed every
-  saved session.
-
-## Configuration
-
-Environment variables:
-
-| Variable | Default | What it does |
-|---|---|---|
-| `MAX_SESSIONS` | `200` | Most users connected at once |
-| `DATABASE_URL` | unset | Where sessions are saved: `postgresql://…`, or `sqlite:///path` for a local file. Unset: nothing is saved and a restart ends every session |
-| `SESSION_ENCRYPTION_KEY` | unset | Encrypts stored API keys and session tokens; required with `DATABASE_URL`. Comma-separate several to rotate (first one encrypts) |
-| `PORT` | `8765` | Port the server listens on |
-| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxies whose `X-Forwarded-*` headers are trusted (real client IPs, HTTPS); set it when running behind a load balancer |
-
-Create an encryption key with
-`uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`,
-and keep a copy somewhere safe: if it's lost, every saved session is lost with it.
-
-**Rotating the encryption key:** set `SESSION_ENCRYPTION_KEY` to `<new key>,<old key>` and restart.
-On start the server re-encrypts every saved session with the new key, so once it reports ready you
-can set it to just `<new key>`. Replacing the key outright, without the old one alongside, makes
-every saved session unreadable: they're deleted on the next start and users must connect again.
-
-**Run a single server per database:** only one server can run the bots. A second one started on the
-same Postgres database waits (see "One server at a time" above) until the first stops.
-
-## Running it on your own computer
+### 2. Get the code and install
 
 ```sh
-brew install uv          # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/PublicDotCom/15-minute-bot.git
+cd 15-minute-bot
 uv sync
+```
+
+The first `uv sync` takes a minute, because uv downloads Python 3.14 and the app's libraries into a
+private `.venv` folder in the project. Nothing is installed system-wide.
+
+### 3. Create a Public API key
+
+1. Log in to public.com and open the API settings page: <https://public.com/settings/security/api>.
+   The setup wizard also links to it.
+2. Generate a secret key and copy it.
+
+Treat the key like a password: anyone who has it can trade in your account. If it's ever exposed,
+delete it on that same page and it stops working immediately.
+
+### 4. Start the app
+
+```sh
 uv run python -m fifteen_bot
 ```
 
-It opens at <http://127.0.0.1:8765>. Locally nothing is saved by default, so stopping the server
-ends the session. To keep it through restarts, set `DATABASE_URL=sqlite:///bot.db` and a
-`SESSION_ENCRYPTION_KEY`. Keep the terminal open; to stop the Mac sleeping while it trades,
-start it with `caffeinate -i uv run python -m fifteen_bot`.
+Your browser opens at <http://127.0.0.1:8765>. Leave the terminal window open: closing it stops
+the app, and with it the bot.
+
+To keep your Mac awake while the bot runs, start it like this instead:
+
+```sh
+caffeinate -i uv run python -m fifteen_bot
+```
+
+`caffeinate -i` stops the Mac idle-sleeping, but closing a laptop lid still puts it to sleep.
+
+### 5. Follow the setup wizard
+
+1. **Connect**: paste your API key.
+2. **Account**: pick the brokerage account the bot should trade in.
+3. **Markets**: choose which 15-minute markets to trade. Start with one or two.
+4. **Your rule**: set when and what to buy, and optionally when to sell early (take-profit and
+   stop-loss). A live example shows what a trade would cost and pay.
+5. **Review**: check what each trade can cost, then **Start trading**, or **Finish without
+   starting** and press Start on the dashboard later.
+
+### 6. Day to day
+
+- **Start/stop trading:** the **Engine** button in the top bar. **Stop** pauses new orders and
+  keeps your markets, rules and results. Contracts you already hold settle as normal.
+- **Close the browser whenever you like:** the bot keeps trading as long as the app is running.
+  Open <http://127.0.0.1:8765> again in the same browser and you're straight back on the
+  dashboard, with live P/L and the full history since you started. In another browser, paste
+  your key again to rejoin the same bot.
+- **Change a market's rule:** **Edit** on its card, or **Edit all strategies** for every market.
+- **Turn a market on/off:** the switch on its card.
+- **See results:** the dashboard shows total P&L, win rate, a per-market table, every trade and an
+  activity log. A trade shows as won/lost a few minutes after its window closes, once Public
+  settles it.
+- **Disconnect** (top bar) ends your session: the bot stops, unfilled orders are cancelled, and
+  your markets, rules and results are cleared.
+- **Stop the app:** press **Ctrl+C** in its terminal. By default that ends the session just like
+  Disconnect, so next time you set the bot up again. To have it carry on where it left off
+  instead, turn on saving (below).
+
+## Keeping your bot through restarts (optional)
+
+By default nothing is written to disk: your key, markets, rules and results live only in the
+app's memory. To keep them when you stop and start the app, give it a database file and an
+encryption key:
+
+```sh
+# Once: create an encryption key, and keep a copy somewhere safe (e.g. a password manager).
+uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# Every time you start the app:
+DATABASE_URL=sqlite:///bot.db SESSION_ENCRYPTION_KEY=<your key> uv run python -m fifteen_bot
+```
+
+- **What's saved:** your session in `bot.db` in the project folder: markets, rules, trade history,
+  the account you picked, whether the bot was running, and your API key **encrypted** with the
+  encryption key. Without the encryption key, the file is useless to anyone who copies it.
+- **When you start the app again,** your bot resumes exactly where it was, **still trading if it
+  was running when you stopped**. Orders that were open when you stopped are picked up again.
+  While the app was stopped, the bot couldn't trade, so windows in that gap are missed.
+- **Disconnect** deletes everything saved for your session. So does leaving the bot stopped
+  with no page open for a day.
+- **One copy at a time:** if you start a second copy of the app on the same database file, it
+  waits (the page shows "The bot is restarting") until the first one stops, so two copies can
+  never trade the same account.
+- **Keep the same encryption key.** If you start the app with a different one, saved sessions
+  can't be read: they're deleted and you set the bot up again. To change keys without losing
+  anything, start once with `SESSION_ENCRYPTION_KEY=<new key>,<old key>` (the app re-encrypts
+  everything with the new key), then use just `<new key>` from then on.
+- `DATABASE_URL` also accepts a Postgres database (`postgresql://…`).
+
+## Updating the app
+
+Stop the app (Ctrl+C), then:
+
+```sh
+git pull                       # get the latest code
+uv sync                        # only needed if dependencies changed; safe to run anyway
+uv run python -m fifteen_bot   # with the same DATABASE_URL and SESSION_ENCRYPTION_KEY, if you use them
+```
+
+Always restart after an update. The browser loads the new page right away, but the running app
+keeps the old code until it restarts, and the mix causes odd errors. With saving turned on, your
+bot carries on after the update; without it, you set it up again.
+
+## Your API key and privacy
+
+- The key is used only to talk to Public. It's never written to logs or shown on the page again,
+  and it's only written to disk if you turn on saving, and then only encrypted.
+- The app listens only on your own computer (`127.0.0.1`), so other devices on your network can't
+  reach it, and it refuses requests from other websites (strict Content-Security-Policy, no
+  cookies, no framing).
+- Your browser remembers your session (a random token in `localStorage`, never the key), which is
+  what lets you come back without pasting the key. Anyone using your browser on this computer
+  could control the bot until you click **Disconnect**. Deleting the key in Public's API
+  settings also cuts it off immediately.
+- If Public stops accepting the key for two minutes (e.g. you deleted it), the app ends the
+  session by itself.
+
+## Configuration
+
+| Setting | Default | What it does |
+|---|---|---|
+| `--port` (or `PORT`) | `8765` | Port the dashboard is served on |
+| `--no-browser` | off | Don't open the browser on start |
+| `DATABASE_URL` | unset | Turns on saving: `sqlite:///bot.db`, or `postgresql://…` (see above) |
+| `SESSION_ENCRYPTION_KEY` | unset | Encrypts your saved API key; required with `DATABASE_URL`. Comma-separate two to change keys (new one first) |
+
+Advanced, for when several people share one running copy or it runs behind a proxy: `--host`
+(default `127.0.0.1`, this computer only), `MAX_SESSIONS` (default `200`, the most people
+connected at once) and `FORWARDED_ALLOW_IPS` (default `127.0.0.1`, proxies whose `X-Forwarded-*`
+headers are trusted). Each person connects with their own key and gets their own bot.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
+| Odd errors after an update | The app is still running old code. Restart it (Ctrl+C, then start again). |
 | "Public didn't accept that key" | Copy the whole key again, or generate a new one. Check it wasn't deleted in Public's API settings. |
-| "Your session has ended" | Someone clicked Disconnect, the bot sat stopped with no page open for a day, Public stopped accepting the key, or the server restarted without a database. Connect again. |
-| "The bot is restarting after an update" | A deploy is under way; the page retries by itself and the bot carries on once the new server has taken over. If it lasts more than a minute or two, check the server's logs and the database. |
-| "This account is already being traded in another session" | Close the other session (Disconnect there), or wait for it to end. |
-| "Too many connection attempts" | Wait a minute and try again. |
-| "The bot is at capacity" | The server has `MAX_SESSIONS` users connected. Try later, or raise the limit. |
-| "Reconnecting to the bot…" banner | The page lost its connection and is retrying. The bot keeps running meanwhile. |
+| "Couldn't reach Public" | Check your internet connection and try again. |
+| "Your session has ended" | You clicked Disconnect, the app was stopped (without saving turned on), the bot sat stopped with no page open for a day, or Public stopped accepting the key. Connect again. |
+| "The bot is restarting" for more than a few seconds | Another copy of the app is running on the same database file. Stop it (Ctrl+C in its terminal). |
+| "Reconnecting to the bot…" banner | The page lost its connection to the app and is retrying. If the app is still running, the bot keeps trading meanwhile. |
+| Port 8765 is already in use | Another copy is probably still running. Stop it, or start this one with `--port 9000`. |
+| The browser doesn't open | Go to <http://127.0.0.1:8765> yourself, or start with `--no-browser` and open it when you like. |
 | A card says "Not supported" | Markets with more than two outcomes (e.g. "Crypto Leader") can't be traded yet. Remove it. |
-| Odd errors after an update (running locally) | Restart the server: Ctrl+C, then start it again. |
+| A card says "Waiting for fresh prices" | Normal for a moment after starting or a network blip. If it persists, check your connection. |
+| Use a different API key | Disconnect, then connect with the new key. |
+| Start completely fresh | Disconnect. With saving turned on you can also stop the app and delete `bot.db`. |
 
 ## How trading works
 
@@ -158,7 +191,7 @@ start it with `caffeinate -i uv run python -m fifteen_bot`.
 - Rule: between *start* and *stop* seconds before the window closes, buy YES/NO/either side
   once its ask is within *[lowest, highest]* chance (price in ¢ = implied %). At most **one trade
   per market per window**. Defaults: 2:00 → 0:10 left, 80–90%, either side, 1 contract.
-- Orders are DAY limit buys at the ask rounded up to the cent, so the bot never pays more than the
+- Orders are DAY limit buys at the ask rounded up to the cent, so you never pay more than the
   price the rule matched. Unfilled orders are cancelled when the window closes.
 - **Selling early (optional):** a rule can also set a *take-profit* and/or a *stop-loss*, in ¢ per
   contract after fees. While the window is open and the engine is running, once
@@ -178,27 +211,42 @@ start it with `caffeinate -i uv run python -m fifteen_bot`.
 - **Selling event contracts through Public's API is untested**: the SDK only has a helper for
   buying them, so sells are sent as generic `SELL` limit orders on the `EVENTCONTRACT` instrument.
   Try a take-profit on a 1-contract position before relying on it.
+- With saving turned on, **every order is saved before it's sent**, so even after a crash the app
+  knows about every order that could exist at Public and never places one twice. If the database
+  can't be written, the bot doesn't send the order.
+
+### Staying under Public's rate limit
+
+Public allows 10 API requests per second per account. Every request the bot makes goes through a
+limiter (`fifteen_bot/ratelimit.py`) that sends at most 8 per second, evenly spaced, with orders
+and cancels ahead of routine price checks. If Public still answers 429, requests pause for its
+Retry-After time. To keep traffic low, prices for all markets come from one batched quote request
+and open orders from one order search; typical use is 1–3 requests per second. Requests time out
+after 10 seconds, so one slow response can't make the bot miss a buy window. Other tools calling
+Public's API for the same account at the same time count toward the same limit.
 
 ## For developers
 
 ```sh
 uv run pytest                                          # run the tests
-uv run python -m fifteen_bot --port 9000 --no-browser  # other port, no auto-open
 TEST_DATABASE_URL=postgresql://… uv run pytest         # also test against a real Postgres
+uv run python -m fifteen_bot --port 9000 --no-browser  # other port, no auto-open
 ```
 
 ```
 fifteen_bot/
   app.py        web server: JSON API + WebSocket + dashboard, all scoped per session
-  sessions.py   per-user sessions: create/rejoin by key, idle expiry, resume/suspend (tested)
-  persist.py    saved sessions: encryption, Postgres/SQLite, takeover lock (tested)
-  engine.py     one user's trading loop: windows, quotes, orders, settlement
+  sessions.py   sessions: create/rejoin by key, idle expiry, resume/suspend (tested)
+  persist.py    optional saving: encryption, SQLite/Postgres, one-copy-at-a-time lock (tested)
+  engine.py     the trading loop: windows, quotes, orders, early exits, settlement
   ratelimit.py  keeps a session under Public's 10/s limit (tested)
   strategy.py   strategy model and pure decision logic (tested)
-  store.py      in-memory SQLite for one session's markets, rules and trades (mirrored to persist)
+  store.py      in-memory SQLite for one session's markets, rules and trades
   static/       dashboard (plain HTML/CSS/JS, no build step)
 .github/        CI: the tests, on every pull request
 tests/          uv run pytest
 ```
+
+`GET /healthz` reports whether the app is up and `"ready"` (has loaded any saved sessions).
 
 Uses the official [`publicdotcom-py`](https://github.com/PublicDotCom/publicdotcom-py) SDK.

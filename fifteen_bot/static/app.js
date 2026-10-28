@@ -233,7 +233,7 @@ async function boot() {
     session = await api("GET", "/api/session");
   } catch (err) {
     if (err.status === 503 || err.status === undefined) {
-      // The server is restarting (an update): the session is kept, so wait and try again.
+      // The app is restarting: the session is kept, so wait and try again.
       $("#conn-banner").classList.remove("hidden");
       return setTimeout(() => boot().catch((e) => toast(e.message, true)), 3000);
     }
@@ -330,7 +330,7 @@ const WIZARD_STEPS = {
     <p class="lead">In a few minutes you'll have a bot that watches Public's 15-minute prediction markets and trades them using rules you choose.</p>
     <div class="how">
       <div class="how-item"><span class="badge">1</span><div><b>Connect your Public account</b><p>Using an API key from Public. ${savesSessions
-        ? "It's stored encrypted, so your bot keeps running through server updates, and deleted when you disconnect."
+        ? "It's stored encrypted, so your bot carries on after the app restarts, and deleted when you disconnect."
         : "It's held in the server's memory only while your bot exists, never written to disk."}</p></div></div>
       <div class="how-item"><span class="badge">2</span><div><b>Pick the markets to trade</b><p>BTC, gold, EUR/USD and more. Each one asks a new yes/no question every 15 minutes.</p></div></div>
       <div class="how-item"><span class="badge">3</span><div><b>Set your rule</b><p>For example: “with 2 minutes left, buy whichever side is priced 80–90¢”.</p></div></div>
@@ -369,12 +369,12 @@ const WIZARD_STEPS = {
       <ul>
         <li>It travels over an encrypted connection to this app's server, and from there only to Public.</li>
         <li>${savesSessions
-          ? "The server stores it encrypted in its database, so your bot keeps running through server updates. It's never written to logs, and never shown on this page again."
+          ? "The app stores it encrypted in its database, so your bot carries on after the app restarts. It's never written to logs, and never shown on this page again."
           : "The server keeps it in memory only. It's never written to disk or to logs, and never shown on this page again."}</li>
         <li>This browser remembers your session, not your key, so you can come back to your running bot without pasting the key again.</li>
         <li>${savesSessions
           ? "The key is deleted when you click Disconnect, or after a day with the bot stopped and no page open."
-          : "The key is forgotten when you click Disconnect, after a day with the bot stopped and no page open, or when the server restarts."}</li>
+          : "The key is forgotten when you click Disconnect, after a day with the bot stopped and no page open, or when the app stops."}</li>
         <li>You can delete the key in Public's API settings at any time, which stops it working immediately.</li>
       </ul>
     </details>

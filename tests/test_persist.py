@@ -27,7 +27,7 @@ async def open_manager(path, **kwargs):
 
 
 async def restart(m, path):
-    """Shut one server down the way a deploy does, and start the next on the same database."""
+    """Stop the app the way Ctrl+C does, and start it again on the same database."""
     await m.suspend_all()
     await m.persister.close()
     return await open_manager(path)
@@ -178,3 +178,23 @@ def test_a_saved_session_is_kept_while_public_is_unreachable(tmp_path):
 
     session, ready = asyncio.run(run())
     assert ready and session is not None and session.engine.client is None  # retried in the background
+
+
+def test_a_second_copy_on_the_same_file_waits_for_the_first_to_stop(tmp_path):
+    db = tmp_path / "bot.db"
+
+    async def run():
+        first = await open_manager(db)
+        second = SessionManager(engine_factory=FakeEngine, persister=persister(db))
+        await second.persister.open()
+        taking_over = asyncio.create_task(second.resume())
+        await asyncio.sleep(1.5)
+        waited = not taking_over.done() and not second.ready
+        await first.suspend_all()
+        await first.persister.close()  # releases the lock file
+        await asyncio.wait_for(taking_over, 5)
+        ready = second.ready
+        await second.persister.close()
+        return waited, ready
+
+    assert asyncio.run(run()) == (True, True)

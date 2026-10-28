@@ -40,7 +40,7 @@ CONNECT_ATTEMPTS_PER_MINUTE = 10  # per IP address: slows key guessing and abuse
 WS_HELLO_TIMEOUT_SECONDS = 10.0
 MAX_MARKETS_PER_SESSION = 50
 LOCK_CHECK_SECONDS = 10.0
-RESTARTING = "The bot is restarting after an update. It'll be back in a moment."
+RESTARTING = "The bot is restarting. It'll be back in a moment."
 
 
 def _persister() -> Optional[Persister]:
@@ -62,8 +62,8 @@ async def lifespan(_: FastAPI):
     tasks = [asyncio.create_task(sessions.run_sweeper())]
     if persister is not None:
         await persister.open()
-        # In the background, so this server passes its health check (and the deploy can retire
-        # the old server, which releases the lock) while it waits to take over.
+        # In the background, so the app starts answering (the page shows "restarting") while it
+        # waits for any other copy using the same database to stop.
         tasks += [asyncio.create_task(_take_over()), asyncio.create_task(persister.run())]
     try:
         yield
