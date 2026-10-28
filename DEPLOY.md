@@ -43,8 +43,18 @@ Everything else (app code, tests, `README.md`, `.github/workflows/ci.yml`) is sh
 The app runs as one container on DigitalOcean App Platform, which provides HTTPS and supports the
 WebSocket each session uses, plus a DigitalOcean Managed PostgreSQL cluster that keeps sessions
 through deploys. It must run as **a single instance**: only one server can run the bots
-(`instance_count: 1` in `.do/app.yaml`). Deploys don't end sessions: bots pause for a few seconds
-while the new server takes over, then carry on (see the README, "Reliability").
+(`instance_count: 1` in `.do/app.yaml`).
+
+Deploys don't end sessions. Saving is on (`DATABASE_URL` points at the cluster), so:
+
+- The old server, on shutdown, pauses its bots and saves them instead of ending them. Their open
+  orders stay open at Public.
+- The new server starts answering health checks right away, but waits for the database lock the
+  old one holds. Meanwhile `/healthz` says `"ready": false`, and the page shows "The bot is
+  restarting" and retries.
+- Once the old server has stopped, the new one takes the lock, resumes every saved bot (still
+  trading if it was) and tracks their open orders. Bots pause for a few seconds; a buy or sell
+  window in that gap can be missed.
 
 | Workflow | Runs on | What it does |
 |---|---|---|
@@ -140,5 +150,5 @@ only because the container is reachable solely through App Platform's load balan
 |---|---|
 | Deploy fails at "Check configuration" | Add the missing secret or variable it names (step 5). |
 | Deploy waits on "ready" and then fails | The new server couldn't take over: check the app's runtime logs, and that the database is up and the app is a trusted source. |
-| The page shows "The bot is restarting after an update" for minutes | Same as above. |
+| The page shows "The bot is restarting" for minutes | Same as above. |
 | "Sync fork" reports a conflict | A shared file was edited in this fork. Undo that change here, make it upstream instead, then sync. |
