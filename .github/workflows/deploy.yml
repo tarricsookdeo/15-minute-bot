@@ -1,0 +1,107 @@
+# Fork-only (not in PublicDotCom/15-minute-bot; see DEPLOY.md). Every push to main (a merged pull
+# request, or syncing this fork with upstream) is tested, then deployed to DigitalOcean App Platform.
+# Needs, in the repository's settings:
+#   secret   DIGITALOCEAN_ACCESS_TOKEN  a DigitalOcean API token (read + write)
+#   secret   SESSION_ENCRYPTION_KEY     encrypts stored API keys (see DEPLOY.md); never change it
+#                                       without rotating (DEPLOY.md), or saved sessions are lost
+#   variable DO_REGISTRY                the DigitalOcean Container Registry's name
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # redeploy main by hand from the Actions tab
+
+permissions:
+  contents: read
+
+# One deploy at a time, in order; a newer merge waits rather than cancelling a running deploy.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  REPOSITORY: fifteen-minute-bot
+  APP_NAME: fifteen-minute-bot
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  container:
+    uses: ./.github/workflows/container.yml
+
+  deploy:
+    name: Deploy to DigitalOcean
+    needs: [ci, container]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration
+        env:
+          DO_REGISTRY: ${{ vars.DO_REGISTRY }}
+          HAS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN != '' }}
+          HAS_KEY: ${{ secrets.SESSION_ENCRYPTION_KEY != '' }}
+        run: |
+          [ "$HAS_TOKEN" = "true" ] || { echo "::error::Add the DIGITALOCEAN_ACCESS_TOKEN secret"; exit 1; }
+          [ "$HAS_KEY" = "true" ] || { echo "::error::Add the SESSION_ENCRYPTION_KEY secret"; exit 1; }
+          [ -n "$DO_REGISTRY" ] || { echo "::error::Add the DO_REGISTRY variable"; exit 1; }
+          echo "IMAGE=registry.digitalocean.com/$DO_REGISTRY/$REPOSITORY" >> "$GITHUB_ENV"
+
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Build and push the image
+        run: |
+          doctl registry login --expiry-seconds 1200
+          docker build --platform linux/amd64 -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+
+      # Deploy the image tagged with this commit, not "latest", so every deployment maps to
+      # exactly one commit and can be rolled back from the App Platform dashboard.
+      - name: Deploy (creates the app on the first run)
+        env:
+          SESSION_ENCRYPTION_KEY: ${{ secrets.SESSION_ENCRYPTION_KEY }}
+        run: |
+          # The key is URL-safe base64 (plus commas when rotating), so it's safe in a sed replacement.
+          sed -E -e "s/^([[:space:]]*tag:).*/\1 ${GITHUB_SHA}/" \
+            -e "s|__SESSION_ENCRYPTION_KEY__|${SESSION_ENCRYPTION_KEY}|" .do/app.yaml > app.rendered.yaml
+          grep -q "tag: ${GITHUB_SHA}" app.rendered.yaml
+          if grep -q "__SESSION_ENCRYPTION_KEY__" app.rendered.yaml; then exit 1; fi  # `set -e` ignores `! cmd`
+          doctl apps create --spec app.rendered.yaml --upsert --update-sources --wait
+          rm app.rendered.yaml
+
+      - name: Check the live app is healthy
+        run: |
+          APP_ID=$(doctl apps list --format ID,Spec.Name --no-header | awk -v name="$APP_NAME" '$2 == name {print $1}')
+          URL=$(doctl apps get "$APP_ID" --format DefaultIngress --no-header)
+          echo "Deployed ${GITHUB_SHA::7} to $URL" >> "$GITHUB_STEP_SUMMARY"
+          # "ready" means the new server has taken over from the old one and resumed every saved session.
+          for i in $(seq 20); do
+            curl -fsS "$URL/healthz" | grep -q '"ready":true' && exit 0
+            sleep 6
+          done
+          echo "::error::$URL/healthz did not report ready after deploying"
+          exit 1
+
+      # The registry's storage is limited; keep the five newest commit images (plus "latest").
+      # Garbage collection makes the registry read-only while it runs, so wait for it to
+      # finish here: the next deploy (queued behind this one) can then push safely.
+      - name: Remove old images
+        continue-on-error: true
+        run: |
+          old=$(doctl registry repository list-tags "$REPOSITORY" --format Tag,UpdatedAt --no-header \
+            | awk '$1 != "latest"' | sort -k2 -r | tail -n +6 | awk '{print $1}')
+          [ -n "$old" ] || { echo "Nothing to remove"; exit 0; }
+          echo "$old" | xargs doctl registry repository delete-tag "$REPOSITORY" --force
+          doctl registry garbage-collection start --include-untagged-manifests --force
+          for i in $(seq 60); do
+            doctl registry garbage-collection get-active >/dev/null 2>&1 || exit 0
+            sleep 10
+          done
+          echo "::warning::Registry garbage collection is still running after 10 minutes"

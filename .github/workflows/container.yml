@@ -1,0 +1,30 @@
+# Fork-only (not in PublicDotCom/15-minute-bot): the production image builds and starts
+# healthy as a non-root user. Runs on pull requests here and before every deploy.
+name: Container
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    name: Container builds and starts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the production image
+        run: docker build --platform linux/amd64 -t fifteen-minute-bot:ci .
+      - name: Start it and check health
+        run: |
+          docker run -d --name app -p 8080:8080 fifteen-minute-bot:ci
+          for i in $(seq 30); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          curl -fsS localhost:8080/healthz
+          curl -fsS -o /dev/null localhost:8080/
+          test "$(docker exec app id -u)" = "10001"  # never runs as root
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs app || true
