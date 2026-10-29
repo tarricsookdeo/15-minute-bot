@@ -88,7 +88,8 @@ function exitText(s) {
 
 function strategyText(s) {
   const exits = exitText(s);
-  return `With ≤ ${clock(s.entry_seconds)} left, buy ${sideText(s.side)} priced ${cents(s.min_price)}–${cents(s.max_price)} · ${num(s.quantity)} contract${num(s.quantity) === 1 ? "" : "s"}${exits ? ` · ${exits}` : ""}`;
+  const limit = num(s.daily_loss_limit) === null ? "" : ` · daily loss limit ${money(s.daily_loss_limit, false)}`;
+  return `With ≤ ${clock(s.entry_seconds)} left, buy ${sideText(s.side)} priced ${cents(s.min_price)}–${cents(s.max_price)} · ${num(s.quantity)} contract${num(s.quantity) === 1 ? "" : "s"}${exits ? ` · ${exits}` : ""}${limit}`;
 }
 
 function toast(message, isError = false) {
@@ -113,7 +114,7 @@ function confirmAction(title, body, okLabel) {
 
 const DEFAULT_STRATEGY = {
   entry_seconds: 120, cutoff_seconds: 10, min_price: "0.80", max_price: "0.90", side: "EITHER", quantity: "1",
-  take_profit: null, stop_loss: null,
+  take_profit: null, stop_loss: null, daily_loss_limit: null,
 };
 
 function strategyFields() {
@@ -128,7 +129,13 @@ function strategyFields() {
     ${field("Contracts per trade", `<input type="number" name="quantity" min="0.01" step="0.01" required>`, "Each winning contract pays out $1.00")}
     ${field("Take profit at (optional)", `<div class="inline"><input type="number" name="take_profit" min="1" max="98" step="1" placeholder="Off"><em>¢ per contract</em></div>`, "Sells early once each contract is up this much after fees")}
     ${field("Stop loss at (optional)", `<div class="inline"><input type="number" name="stop_loss" min="1" max="98" step="1" placeholder="Off"><em>¢ per contract</em></div>`, "Sells early once each contract is down this much after fees")}
+    ${field("Daily loss limit for this market (optional)", limitInput("daily_loss_limit"), "Stops buying it before the day's loss could pass this")}
   </div>`;
+}
+
+/** A dollar amount field for a daily loss limit; blank means no limit. */
+function limitInput(name, id = "") {
+  return `<div class="inline"><em>$</em><input type="number" name="${name}"${id ? ` id="${id}"` : ""} min="0.01" step="0.01" placeholder="Off"></div>`;
 }
 
 function fillStrategy(form, s) {
@@ -141,10 +148,20 @@ function fillStrategy(form, s) {
   f.quantity.value = num(s.quantity);
   f.take_profit.value = num(s.take_profit) === null ? "" : Math.round(num(s.take_profit) * 100);
   f.stop_loss.value = num(s.stop_loss) === null ? "" : Math.round(num(s.stop_loss) * 100);
+  f.daily_loss_limit.value = num(s.daily_loss_limit) ?? "";
 }
 
 /** A blank exit field means off (null); otherwise cents in the form, dollars in the API. */
 const readTarget = (input) => (input.value.trim() === "" ? null : String(Number(input.value) / 100));
+/** A blank loss limit means off (null); otherwise dollars. */
+const readLimit = (input) => (input.value.trim() === "" ? null : input.value.trim());
+
+function limitProblem(limit, name) {
+  if (limit === null) return null;
+  const c = Math.round(num(limit) * 100 * 1e6) / 1e6;
+  if (Number.isInteger(c) && c >= 1 && c <= 1e8) return null;
+  return `${name} must be between $0.01 and $1,000,000 in whole cents, or blank for off.`;
+}
 
 function readStrategy(form) {
   const f = form.elements;
@@ -157,6 +174,7 @@ function readStrategy(form) {
     quantity: f.quantity.value,
     take_profit: readTarget(f.take_profit),
     stop_loss: readTarget(f.stop_loss),
+    daily_loss_limit: readLimit(f.daily_loss_limit),
   };
 }
 
@@ -174,7 +192,7 @@ function strategyProblem(s) {
       return `${name} must be a whole number of cents from 1 to 98, or blank for off.`;
     }
   }
-  return null;
+  return limitProblem(s.daily_loss_limit, "The daily loss limit");
 }
 
 function strategyPreview(s) {
@@ -188,7 +206,14 @@ function strategyPreview(s) {
     <div class="example"><b>Example:</b> with ${clock(exampleLeft)} left, ${exampleSide} is at ${cents(example)}. The bot buys ${q} ${exampleSide}
     for ${money(q * example, false)}. If ${exampleSide} wins you get ${money(q, false)} back
     (<span class="pos">${money(q * (1 - example))}</span>); if it loses you lose <span class="neg">${money(q * example, false)}</span>. Fees not included.</div>
-    ${exitPreview(s)}`;
+    ${exitPreview(s)}${limitPreview(s)}`;
+}
+
+function limitPreview(s) {
+  if (s.daily_loss_limit === null) return "";
+  return `<div class="example"><b>Daily loss limit:</b> before each buy, the bot checks that even if this buy and every open trade
+    in this market lost, the market's loss today couldn't pass <b class="neg">${money(s.daily_loss_limit, false)}</b>. If it could, the bot
+    stops buying this market until you press Resume on its card. Days start at midnight US Eastern.</div>`;
 }
 
 function exitPreview(s) {
@@ -437,6 +462,8 @@ const WIZARD_STEPS = {
       <dt>Rule</dt><dd>${esc(strategyText(s))}</dd>
       <dt>Most per trade</dt><dd>${money(num(s.quantity) * num(s.max_price), false)} plus fees, per market, per 15-minute window</dd>
     </dl>
+    <label class="field review-limit"><span>Daily loss limit for the whole account (optional)</span>${limitInput("account_limit", "wiz-account-limit")}
+      <small class="hint">Stops buying on every market before the day's loss across all of them could pass this. You can change it on the dashboard.</small></label>
     <div class="callout">
       <b>What happens next</b>
       <ol>
@@ -573,9 +600,12 @@ async function connectFromWizard(apiKey) {
 
 async function finishWizard(start) {
   $("#finish-error").textContent = "";
+  const limit = readLimit($("#wiz-account-limit"));
+  const problem = limitProblem(limit, "The account's daily loss limit");
+  if (problem) return ($("#finish-error").textContent = problem);
   $("#onboard-body").querySelectorAll(".wizard-actions button").forEach((b) => (b.disabled = true));
   try {
-    await api("POST", "/api/onboarding", { series: [...wiz.selected], strategy: wiz.strategy, start });
+    await api("POST", "/api/onboarding", { series: [...wiz.selected], strategy: wiz.strategy, daily_loss_limit: limit, start });
   } catch (err) {
     $("#finish-error").textContent = err.message;
     $("#onboard-body").querySelectorAll(".wizard-actions button").forEach((b) => (b.disabled = false));
@@ -672,9 +702,12 @@ function setState(next) {
 
 function renderTopbar() {
   const btn = $("#engine-btn");
-  btn.classList.toggle("on", state.running);
-  btn.innerHTML = `<span class="dot"></span>${state.running ? "Engine running — Stop" : "Engine stopped — Start"}`;
+  const halted = state.running && Boolean(state.loss_limit.halted_at);
+  btn.classList.toggle("on", state.running && !halted);
+  btn.classList.toggle("halted", halted);
+  btn.innerHTML = `<span class="dot"></span>${halted ? "Loss limit reached — Resume" : state.running ? "Engine running — Stop" : "Engine stopped — Start"}`;
   $("#account-label").textContent = `Account ${state.account_id}`;
+  $("#limit-banner").classList.toggle("hidden", !state.loss_limit.halted_at);
 }
 
 /** The card's live view of a trade that hasn't settled yet. */
@@ -711,10 +744,26 @@ function renderSummary() {
     ["Settled trades", `${settled} <span class="muted small">(${t.wins}W · ${t.losses}L)</span>`],
     ["Pending", t.pending],
     ["Return on stake", cost ? `<span class="${pnlClass(t.pnl)}">${((num(t.pnl) / cost) * 100).toFixed(1)}%</span>` : "—"],
+    ["Today, settled", todayStat(state.loss_limit)],
   ]
     .map(([label, value]) => `<div class="stat"><div class="label">${label}</div><div class="value">${value}</div></div>`)
     .join("");
 }
+
+/** Today's settled P&L, with the account's daily loss limit and how much of it is left. */
+function todayStat(l) {
+  const today = `<span class="${pnlClass(l.today_pnl)}">${money(l.today_pnl)}</span>`;
+  if (l.limit === null) {
+    return `${today}<div class="sub">No daily loss limit · <button class="btn link" type="button" data-action="edit-limit">Set one</button></div>`;
+  }
+  const room = Math.max(0, num(l.limit) + num(l.today_pnl) - num(l.at_risk));
+  return `${today}<div class="sub">Limit ${money(l.limit, false)} · ${money(room, false)} left
+    · <button class="btn link" type="button" data-action="edit-limit">Edit</button></div>`;
+}
+
+$("#summary").addEventListener("click", (e) => {
+  if (e.target.closest("[data-action]")?.dataset.action === "edit-limit") openLimitDialog();
+});
 
 function secondsLeft(closeTime) {
   return (new Date(closeTime) - (Date.now() + clockOffsetMs)) / 1000;
@@ -757,10 +806,12 @@ function renderMarkets() {
             <div class="quote ${quoteInRange(m, "NO", no) ? "in-range" : ""}"><span>NO ask</span><b>${cents(no)}</b></div>
           </div>` : ""}
         ${m.position ? positionBlock(m.position) : ""}
-        <div class="strategy-line">${esc(strategyText(m.strategy))}</div>
+        <div class="strategy-line">${esc(strategyText(m.strategy))}${num(m.strategy.daily_loss_limit) === null ? "" : `
+          <div class="muted small">Today ${money(m.today.pnl)} settled · ${money(m.today.at_risk, false)} at risk</div>`}</div>
         <div class="market-foot">
           <div><span class="${pnlClass(st.pnl)}"><b>${money(st.pnl)}</b></span> <span class="muted">· ${st.wins}W–${st.losses}L${st.pending ? ` · ${st.pending} pending` : ""}</span></div>
           <div>
+            ${m.enabled && m.halted_at ? `<button class="btn link" data-action="resume" type="button">Resume</button>` : ""}
             <button class="btn link" data-action="edit" type="button">Edit</button>
             <button class="btn link" data-action="remove" type="button">Remove</button>
           </div>
@@ -776,6 +827,14 @@ function renderMarkets() {
  */
 function cardStatus(m) {
   const w = m.window, s = m.strategy, t = m.window_trade;
+  if (m.enabled && !t) {
+    if (m.halted_at) {
+      return { tone: "bad", label: "Stopped by its daily loss limit", detail: "No new buys. Take-profit and stop-loss sells carry on. Resume to buy again." };
+    }
+    if (state.running && state.loss_limit.halted_at) {
+      return { tone: "bad", label: "Paused by the account's loss limit", detail: "No new buys. Press Resume in the top bar to buy again." };
+    }
+  }
   if (!w) {
     return state.markets.some((other) => other.window)
       ? { tone: "idle", label: "No window right now", detail: "This market isn't trading at the moment." }
@@ -849,6 +908,10 @@ $("#markets").addEventListener("click", async (e) => {
   if (!action || !series || action === "toggle") return;
   const market = state.markets.find((m) => m.series === series);
   if (action === "edit") openStrategyDialog([series], market.strategy, market.name);
+  if (action === "resume") {
+    const ok = await confirmAction(`Resume buying ${market.name}?`, RESUME_WARNING, "Resume");
+    if (ok) setState(await api("PUT", `/api/markets/${encodeURIComponent(series)}`, { enabled: true }));
+  }
   if (action === "remove") {
     const ok = await confirmAction(`Remove ${market.name}?`, "The bot stops trading it. Its trade history is kept.", "Remove");
     if (ok) setState(await api("DELETE", `/api/markets/${encodeURIComponent(series)}`));
@@ -915,7 +978,7 @@ async function refreshTrades() {
         <td>${esc(names[t.series] ?? t.series)}</td>
         <td>${esc(t.side)}</td>
         <td class="num">${qty}</td>
-        <td class="num">${cents(t.avg_price ?? t.limit_price)}</td>
+        <td class="num">${cents(num(t.avg_price) > 0 ? t.avg_price : t.limit_price)}</td>
         <td class="num">${t.seconds_left ?? "—"}s</td>
         <td><span class="pill ${esc(t.result)}">${esc(t.result.toLowerCase())}</span>${num(t.sold_quantity) > 0 && t.result !== "SOLD"
           ? ` <span class="muted small">${num(t.sold_quantity)} sold early</span>` : ""}${t.exit_reason && num(t.sold_quantity) > 0
@@ -931,9 +994,15 @@ $("#trade-filter").addEventListener("change", refreshTrades);
 
 // --- top bar actions ------------------------------------------------------------
 
+const RESUME_WARNING = "If you resume with the same limit today, the bot stops again before any buy that could pass it. "
+  + "To trade more today, raise the limit first.";
+
 $("#engine-btn").addEventListener("click", async () => {
-  const running = !state.running;
-  if (running) {
+  const halted = state.running && Boolean(state.loss_limit.halted_at);
+  const running = halted || !state.running;
+  if (halted) {
+    if (!(await confirmAction("Resume buying?", RESUME_WARNING, "Resume"))) return;
+  } else if (running) {
     const enabled = state.markets.filter((m) => m.enabled).length;
     const ok = await confirmAction(
       "Start trading?",
@@ -1005,6 +1074,30 @@ $("#edit-all-btn").addEventListener("click", () => {
 });
 
 document.querySelectorAll("dialog [data-close]").forEach((btn) => btn.addEventListener("click", () => btn.closest("dialog").close()));
+
+// --- daily loss limit dialog ----------------------------------------------------------
+
+const limitForm = $("#limit-form");
+
+function openLimitDialog() {
+  limitForm.elements.daily_loss_limit.value = num(state.loss_limit.limit) ?? "";
+  $("#limit-error").textContent = "";
+  $("#limit-dialog").showModal();
+}
+
+limitForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const limit = readLimit(limitForm.elements.daily_loss_limit);
+  const problem = limitProblem(limit, "The daily loss limit");
+  if (problem) return ($("#limit-error").textContent = problem);
+  try {
+    setState(await api("PUT", "/api/loss-limit", { daily_loss_limit: limit }));
+    $("#limit-dialog").close();
+    toast(limit === null ? "Daily loss limit turned off" : "Daily loss limit saved");
+  } catch (err) {
+    $("#limit-error").textContent = err.message;
+  }
+});
 
 // --- market browser -----------------------------------------------------------------
 

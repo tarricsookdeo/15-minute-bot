@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
 
 FLUSH_SECONDS = 0.5
 LOCK_ID = 15_900_015  # any constant; identifies this app's advisory lock
+# The database can drop connections without warning (a restart, a maintenance window, a
+# change to who may connect). Notice within seconds instead of waiting minutes on a dead
+# socket, which would hold up connecting and every order (they're saved before they're sent).
+CONNECTION_OPTIONS = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 10,
+    "keepalives_interval": 5,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 10_000,  # ms; gives up on a write the server never acknowledges
+}
+DB_TIMEOUT_SECONDS = 15
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bot_sessions (
@@ -203,7 +215,15 @@ class PostgresBackend(Backend):
     async def open(self) -> None:
         from psycopg_pool import AsyncConnectionPool
 
-        self._pool = AsyncConnectionPool(self.url, min_size=1, max_size=2, open=False)
+        self._pool = AsyncConnectionPool(
+            self.url,
+            min_size=1,
+            max_size=2,
+            kwargs=CONNECTION_OPTIONS,
+            check=AsyncConnectionPool.check_connection,  # replace a connection the server closed while idle
+            timeout=DB_TIMEOUT_SECONDS,
+            open=False,
+        )
         await self._pool.open(wait=True, timeout=30)
         async with self._pool.connection() as conn:
             await conn.execute(SCHEMA)
@@ -219,12 +239,12 @@ class PostgresBackend(Backend):
     async def wait_for_lock(self) -> None:
         import psycopg
 
-        self._lock_conn = await psycopg.AsyncConnection.connect(self.url, autocommit=True)
+        self._lock_conn = await psycopg.AsyncConnection.connect(self.url, autocommit=True, **CONNECTION_OPTIONS)
         await self._lock_conn.execute("SELECT pg_advisory_lock(%s)", (LOCK_ID,))
 
     async def lock_held(self) -> bool:
         try:
-            await self._lock_conn.execute("SELECT 1")
+            await asyncio.wait_for(self._lock_conn.execute("SELECT 1"), DB_TIMEOUT_SECONDS)
             return True
         except Exception:
             return False

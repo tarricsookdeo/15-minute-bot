@@ -10,6 +10,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 CENT = Decimal("0.01")
+MAX_LOSS_LIMIT = Decimal("1000000")
 
 Side = Literal["YES", "NO"]
 ExitReason = Literal["TAKE_PROFIT", "STOP_LOSS"]
@@ -32,6 +33,9 @@ class Strategy(BaseModel):
     quantity: Decimal = Field(Decimal("1"), gt=0, le=Decimal("10000"), decimal_places=2)
     take_profit: Optional[Decimal] = Field(None, ge=CENT, le=Decimal("0.98"), description="Sell once up this much.")
     stop_loss: Optional[Decimal] = Field(None, ge=CENT, le=Decimal("0.98"), description="Sell once down this much.")
+    daily_loss_limit: Optional[Decimal] = Field(
+        None, ge=CENT, le=MAX_LOSS_LIMIT, description="Stop buying this market before a day's loss could pass this."
+    )
 
     @model_validator(mode="after")
     def _check_ranges(self) -> "Strategy":
@@ -44,7 +48,14 @@ class Strategy(BaseModel):
         for target in (self.take_profit, self.stop_loss):
             if target is not None and target != target.quantize(CENT):
                 raise ValueError("take-profit and stop-loss must be whole cents")
+        check_loss_limit(self.daily_loss_limit)
         return self
+
+
+def check_loss_limit(limit: Optional[Decimal]) -> Optional[Decimal]:
+    if limit is not None and limit != limit.quantize(CENT):
+        raise ValueError("a daily loss limit must be whole cents")
+    return limit
 
 
 @dataclass(frozen=True)
@@ -122,3 +133,13 @@ def settle_pnl(
     """
     payout = filled - sold if won else Decimal(0)
     return payout + proceeds - filled * avg_price - fees
+
+
+def would_pass_limit(limit: Optional[Decimal], today_pnl: Decimal, at_risk: Decimal, order_cost: Decimal) -> bool:
+    """Whether a buy costing `order_cost` could take the day's loss past `limit`.
+
+    The worst case for the day: what's already been lost (`today_pnl` is negative
+    for a loss, and gains give room), plus everything still open losing in full
+    (`at_risk`), plus this buy losing in full. None means no limit.
+    """
+    return limit is not None and at_risk + order_cost - today_pnl > limit

@@ -17,6 +17,7 @@ import signal
 import time
 from collections import deque
 from contextlib import asynccontextmanager, suppress
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -26,11 +27,11 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from public_api_sdk import APIError, AuthenticationError
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from .persist import Cipher, Persister, backend_for
 from .sessions import AccountInUseError, Session, SessionLimitError, SessionManager
-from .strategy import Strategy
+from .strategy import CENT, MAX_LOSS_LIMIT, Strategy, check_loss_limit
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +306,20 @@ async def set_engine(body: EngineBody, session: CurrentSession):
     return session.engine.snapshot()
 
 
+# Dollars; None turns the limit off.
+LossLimit = Annotated[Optional[Decimal], Field(ge=CENT, le=MAX_LOSS_LIMIT), AfterValidator(check_loss_limit)]
+
+
+class LossLimitBody(BaseModel):
+    daily_loss_limit: LossLimit = None
+
+
+@app.put("/api/loss-limit")
+async def set_loss_limit(body: LossLimitBody, session: CurrentSession):
+    session.engine.set_loss_limit(body.daily_loss_limit)
+    return session.engine.snapshot()
+
+
 @app.get("/api/state")
 async def state(session: CurrentSession):
     return session.engine.snapshot()
@@ -383,6 +398,7 @@ async def apply_strategy(body: BulkStrategyBody, session: CurrentSession):
 class OnboardingBody(BaseModel):
     series: list[str] = Field(min_length=1, max_length=MAX_MARKETS_PER_SESSION)
     strategy: Strategy
+    daily_loss_limit: LossLimit = None
     start: bool = False
 
 
@@ -395,6 +411,8 @@ async def finish_onboarding(body: OnboardingBody, session: CurrentSession):
     _add_markets(session, body.series, await _known_markets(session))
     for series in body.series:
         engine.store.update_market(series, enabled=True, strategy=body.strategy)
+    if body.daily_loss_limit is not None:
+        engine.set_loss_limit(body.daily_loss_limit)
     engine.store.set_setting("onboarded", "1")
     if body.start:
         engine.set_running(True)

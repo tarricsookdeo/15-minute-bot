@@ -164,6 +164,7 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 .review { display: grid; grid-template-columns: max-content 1fr; gap: 10px 20px; margin: 0 0 18px; }
 .review dt { color: var(--muted); }
 .review dd { margin: 0; }
+.review-limit { max-width: 360px; margin-bottom: 18px; }
 
 .wizard-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 .wizard-actions .actions { align-items: center; }
@@ -182,6 +183,8 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 .top-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 #engine-btn .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; background: var(--muted); }
 #engine-btn.on .dot { background: var(--pos); box-shadow: 0 0 0 3px rgba(47, 191, 113, .25); }
+#engine-btn.halted { border-color: var(--warn); }
+#engine-btn.halted .dot { background: var(--warn); }
 
 
 .banner { padding: 8px 24px; font-size: 13px; border-bottom: 1px solid var(--border); }
@@ -198,6 +201,8 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 60px; display: grid
 .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
 .stat .label { font-size: 12px; color: var(--muted); }
 .stat .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.stat .sub { font-size: 12px; font-weight: 400; color: var(--muted); margin-top: 2px; }
+.stat .sub .btn.link { padding: 0; font-size: 12px; color: var(--accent); }
 
 /* Market cards */
 .market-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }

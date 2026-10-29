@@ -1,5 +1,5 @@
 [project]
-name = "15-minute-bot"
+name = "15-minute-prediction-market-bot"
 version = "0.1.0"
 description = "Local dashboard that trades Public.com 15-minute prediction markets with per-market rules"
 requires-python = ">=3.14"
@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.28.1",
     "psycopg[binary,pool]>=3.3.6",
     "publicdotcom-py>=0.1.27",
+    "tzdata>=2026.6",
     "uvicorn[standard]>=0.54.0",
 ]
 

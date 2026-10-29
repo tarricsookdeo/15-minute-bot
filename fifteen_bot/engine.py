@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import httpx
 import public_api_sdk
@@ -54,6 +55,7 @@ from .strategy import (
     pick_contract,
     sell_price,
     settle_pnl,
+    would_pass_limit,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,11 @@ TICK_SECONDS = 2.0
 EVENT_REFRESH_SECONDS = 10.0  # how often to look for a market's next window
 AVAILABLE_REFRESH_SECONDS = 30.0
 DETAILS_REFRESH_SECONDS = 30.0  # contract symbols, close time and trading state of each window
+# Public lists a new window a little before it can return its details (usually seconds, sometimes
+# minutes). Until then, ask again every few seconds, and only mention it if it drags on.
+UNOPENED_RETRY_SECONDS = 5.0
+UNOPENED_WARN_SECONDS = 60.0
+UNOPENED_NOTE = "Waiting for Public to open this window"
 QUOTE_HOT_SECONDS = 2.0  # price refresh while any market is in (or near) its entry window
 QUOTE_COLD_SECONDS = 10.0
 MAX_QUOTE_AGE_SECONDS = 5.0  # never trade on prices older than this
@@ -71,6 +78,9 @@ SETTLE_GRACE_SECONDS = 30  # windows settle a few minutes after they close
 SETTLE_POLL_SECONDS = 20.0
 ORDER_LOOKUP_GRACE_SECONDS = 30
 EXIT_RETRY_SECONDS = 5.0  # a sell not filled by then is cancelled and re-priced at the new bid
+# Public is sometimes slow or unreachable for a minute or two; the bot retries every tick, and
+# says so in the activity log at most this often.
+CONNECTION_LOG_SECONDS = 60.0
 
 TERMINAL_ORDER_STATUSES = {
     OrderStatus.FILLED.value,
@@ -84,6 +94,7 @@ TERMINAL_ORDER_STATUSES = {
 # NOT_SENT: it couldn't be saved first, so it was never sent; a later tick can try again.
 EXIT_DONE_STATUSES = TERMINAL_ORDER_STATUSES | {"NOT_FOUND", "NOT_SENT"}
 EXIT_LABELS = {"TAKE_PROFIT": "take-profit", "STOP_LOSS": "stop-loss"}
+TRADING_DAY_ZONE = ZoneInfo("America/New_York")  # daily loss limits count from midnight here
 
 
 def utcnow() -> datetime:
@@ -92,6 +103,13 @@ def utcnow() -> datetime:
 
 def as_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def trading_day_start(now: Optional[datetime] = None) -> datetime:
+    """The start of today's trading day (midnight US Eastern), in UTC."""
+    local = (now or utcnow()).astimezone(TRADING_DAY_ZONE)
+    midnight = datetime(local.year, local.month, local.day, tzinfo=TRADING_DAY_ZONE)
+    return midnight.astimezone(timezone.utc)
 
 
 def market_name(title: Optional[str], series: str) -> str:
@@ -116,6 +134,8 @@ class Window:
     tradable: bool = False
     multi_outcome: bool = False
     details_at: float = float("-inf")
+    unopened_since: Optional[float] = None  # when Public first said it has no details for this window yet
+    unopened_warned: bool = False
     priced_at: float = float("-inf")
     note: Optional[str] = None
 
@@ -159,6 +179,7 @@ class Engine:
         self._settle_checked: dict[int, float] = {}
         self._cancel_sent: set[int] = set()  # trade ids whose buy order was cancelled
         self._exit_cancel_sent: set[int] = set()  # exit ids whose sell order was cancelled
+        self._trouble_logged_at = float("-inf")  # last time the activity log said Public was slow or unreachable
         # Awaited after recording an order and before sending it; with a database, this saves
         # the record first, so a crash can never leave an order at Public that we don't know about.
         self.checkpoint: Callable[[], Awaitable[None]] = _nothing
@@ -246,7 +267,19 @@ class Engine:
         if running != self.running:
             self.running = running
             self._log("info", None, f"Engine {'started' if running else 'stopped'}")
+        if running and self.store.get_setting("halted_at") is not None:
+            self.store.set_setting("halted_at", None)
+            self._log("info", None, "Buying resumed after the daily loss limit")
         self.store.set_setting("running", "1" if running else "0")
+
+    def loss_limit(self) -> Optional[Decimal]:
+        """The account-wide daily loss limit, or None."""
+        value = self.store.get_setting("daily_loss_limit")
+        return Decimal(value) if value is not None else None
+
+    def set_loss_limit(self, limit: Optional[Decimal]) -> None:
+        self.store.set_setting("daily_loss_limit", str(limit) if limit is not None else None)
+        self._log("info", None, f"Daily loss limit {f'set to ${limit:.2f}' if limit is not None else 'turned off'}")
 
     # --- loop -------------------------------------------------------------
 
@@ -257,7 +290,7 @@ class Engine:
                 await self._tick()
             except Exception as exc:  # keep the loop alive whatever happens
                 logger.exception("%stick failed", self._prefix)
-                self._log("error", None, f"Engine error: {exc}")
+                self._log("error", None, f"Engine error: {_describe(exc)}")
             await asyncio.sleep(max(0.5, TICK_SECONDS - (time.monotonic() - started)))
 
     async def _tick(self) -> None:
@@ -283,8 +316,18 @@ class Engine:
         try:
             await step
         except Exception as exc:
+            if (problem := _connection_problem(exc)) is not None:
+                self._connection_trouble(series, problem)
+                return
             logger.exception("%sstep failed for %s", self._prefix, series)
             self._log("error", series, str(exc))
+
+    def _connection_trouble(self, series: Optional[str], problem: str) -> None:
+        """Public slow or unreachable: it passes, and the next tick retries, so keep it short and rare."""
+        logger.warning("%s%s%s; retrying", self._prefix, f"[{series}] " if series else "", problem)
+        if time.monotonic() - self._trouble_logged_at >= CONNECTION_LOG_SECONDS:
+            self._trouble_logged_at = time.monotonic()
+            self.log.append({"time": now_iso(), "level": "warn", "series": None, "message": f"{problem}; retrying"})
 
     # --- discovery --------------------------------------------------------
 
@@ -355,10 +398,22 @@ class Engine:
     async def _refresh_details(self, window: Window) -> None:
         """Contract symbols, close time and trading state: once per window, then occasionally."""
         assert self.client is not None
-        if window.multi_outcome or time.monotonic() - window.details_at < DETAILS_REFRESH_SECONDS:
+        wait = UNOPENED_RETRY_SECONDS if window.unopened_since is not None else DETAILS_REFRESH_SECONDS
+        if window.multi_outcome or time.monotonic() - window.details_at < wait:
             return
-        details = await self.client.get_event_details(window.event_symbol)
+        try:
+            details = await self.client.get_event_details(window.event_symbol)
+        except APIError as exc:
+            if not _not_opened_yet(exc):
+                raise
+            self._window_not_opened(window)
+            return
         window.details_at = time.monotonic()
+        if window.unopened_since is not None:
+            if window.unopened_warned:
+                self._log("info", self._series_of(window), "Public opened this window; trading it as normal")
+            window.unopened_since, window.unopened_warned = None, False
+            window.note = None
         outcome = details.outcome
         if outcome is None:
             window.multi_outcome = True
@@ -372,6 +427,24 @@ class Engine:
         if outcome.close_time is not None:
             window.close_time = as_utc(outcome.close_time)
         window.tradable = outcome.is_tradable and not details.halted
+
+    def _window_not_opened(self, window: Window) -> None:
+        """Public doesn't have this window's details yet: normal for a window that just opened."""
+        now = time.monotonic()
+        window.details_at = now
+        window.note = UNOPENED_NOTE
+        if window.unopened_since is None:
+            window.unopened_since = now
+        elif not window.unopened_warned and now - window.unopened_since >= UNOPENED_WARN_SECONDS:
+            window.unopened_warned = True
+            self._log(
+                "warn", self._series_of(window),
+                f"Public still hasn't opened this window after {UNOPENED_WARN_SECONDS:.0f}s; "
+                "it can't be traded until Public does",
+            )
+
+    def _series_of(self, window: Window) -> Optional[str]:
+        return next((series for series, w in self.windows.items() if w is window), None)
 
     async def _refresh_quotes(self, live: list[tuple[dict[str, Any], Window]]) -> None:
         """Prices for every market's YES and NO contracts in one request (per 50 contracts)."""
@@ -415,13 +488,15 @@ class Engine:
         strategy: Strategy = market["strategy"]
         if not (self.running and market["enabled"]) or window.multi_outcome:
             return
+        if market["halted_at"] or self.store.get_setting("halted_at"):
+            return  # a daily loss limit stopped buying; take-profit and stop-loss sells carry on
         if self.store.has_trade(series, window.event_symbol):
             return
         seconds_left = window.seconds_left()
         if not in_entry_window(strategy, seconds_left):
             return
         if not window.tradable or window.yes_symbol is None or window.no_symbol is None:
-            window.note = "Window is not tradable right now"
+            window.note = UNOPENED_NOTE if window.unopened_since is not None else "Window is not tradable right now"
             return
         if time.monotonic() - window.priced_at > MAX_QUOTE_AGE_SECONDS:
             window.note = "Waiting for fresh prices"
@@ -450,6 +525,9 @@ class Engine:
             "close_time": window.closes_at.isoformat(),
         }
         summary = f"{pick.side} x{quantity} @ {_cents(pick.price)} with {int(seconds_left)}s left"
+        order_cost = quantity * pick.price
+        if self._loss_limit_reached(series, strategy, order_cost):
+            return
 
         # Preflight checks the order with Public without placing it, and gives the fee estimate.
         try:
@@ -459,8 +537,19 @@ class Engine:
             if preflight.estimated_cost is not None:
                 trade["est_fees"] = max(Decimal(0), preflight.estimated_cost - preflight.order_value)
         except APIError as exc:
+            if (problem := _connection_problem(exc)) is not None:
+                # Nothing was placed, so try again next tick rather than giving up on the window.
+                window.note = f"{problem}; trying again"
+                self._connection_trouble(series, problem)
+                return
             self.store.insert_trade(**trade, order_status="PREFLIGHT_FAILED", result="REJECTED", note=str(exc))
             self._log("error", series, f"Preflight rejected {summary}: {exc}")
+            return
+        # Again with the fees. Nothing awaits between this check and recording the trade below, so
+        # markets buying at the same moment each see the others' trades and can't pass a limit together.
+        if self.store.get_setting("halted_at") is not None:
+            return  # another market's buy stopped every market meanwhile
+        if self._loss_limit_reached(series, strategy, order_cost + trade.get("est_fees", Decimal(0))):
             return
 
         # Record the order before sending it, so a crash or timeout can never lead to a second order.
@@ -478,12 +567,50 @@ class Engine:
             )
         except APIError as exc:
             # The request may still have reached Public; order tracking looks it up and settles the row.
-            self.store.update_trade(trade_id, order_status="SUBMIT_ERROR", note=str(exc))
-            self._log("error", series, f"Order failed {summary}: {exc}")
+            self.store.update_trade(trade_id, order_status="SUBMIT_ERROR", note=_describe(exc))
+            self._log("error", series, f"Order failed {summary}: {_describe(exc)}")
             return
         self.store.update_trade(trade_id, order_status=OrderStatus.NEW.value)
         window.note = f"Ordered {summary}"
         self._log("trade", series, f"Ordered {summary}")
+
+    # --- daily loss limits ------------------------------------------------
+
+    def _today(self) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+        """Per market: today's settled net P&L, and the most its open trades could still lose."""
+        pnl = self.store.pnl_since(trading_day_start().isoformat(timespec="seconds"))
+        at_risk: dict[str, Decimal] = {}
+        for trade in self.store.pending_trades():
+            at_risk[trade["series"]] = at_risk.get(trade["series"], Decimal(0)) + _at_risk(trade)
+        return pnl, at_risk
+
+    def _loss_limit_reached(self, series: str, strategy: Strategy, order_cost: Decimal) -> bool:
+        """Whether this buy could take the day's loss past a limit; if so, stop buying until resumed."""
+        pnl, at_risk = self._today()
+        limit = self.loss_limit()
+        total_pnl, total_risk = sum(pnl.values(), Decimal(0)), sum(at_risk.values(), Decimal(0))
+        if would_pass_limit(limit, total_pnl, total_risk, order_cost):
+            assert limit is not None
+            self.store.set_setting("halted_at", now_iso())
+            worst = total_risk + order_cost - total_pnl
+            self._log(
+                "warn", series,
+                f"Daily loss limit: stopped buying on every market. This buy could have taken today's loss to "
+                f"${worst:.2f}, past the ${limit:.2f} limit. Press Resume to buy again.",
+            )
+            return True
+        market_pnl, market_risk = pnl.get(series, Decimal(0)), at_risk.get(series, Decimal(0))
+        if would_pass_limit(strategy.daily_loss_limit, market_pnl, market_risk, order_cost):
+            assert strategy.daily_loss_limit is not None
+            self.store.halt_market(series)
+            worst = market_risk + order_cost - market_pnl
+            self._log(
+                "warn", series,
+                f"Daily loss limit: stopped buying this market. This buy could have taken today's loss to "
+                f"${worst:.2f}, past its ${strategy.daily_loss_limit:.2f} limit. Press Resume on its card to buy again.",
+            )
+            return True
+        return False
 
     # --- early exits ------------------------------------------------------
 
@@ -520,7 +647,7 @@ class Engine:
             return
         quantity = Decimal(trade["quantity"])
         buy_fees = Decimal(trade["est_fees"]) * filled / quantity
-        cost = Decimal(trade["avg_price"] or trade["limit_price"]) + buy_fees / filled
+        cost = _price(trade) + buy_fees / filled
         # Selling costs about what buying did; Public quotes no fee for a sell before it's placed.
         sell_fee = Decimal(trade["est_fees"]) / quantity
         reason = exit_reason(strategy, cost, price, sell_fee)
@@ -558,8 +685,8 @@ class Engine:
             await self.client.place_order(_sell_order(trade["contract_symbol"], quantity, price, order_id), self.account_id)
         except APIError as exc:
             # The request may still have reached Public; order tracking looks it up either way.
-            self.store.update_exit(exit_id, order_status="SUBMIT_ERROR", note=str(exc))
-            self._log("error", series, f"Sell failed {summary}: {exc}")
+            self.store.update_exit(exit_id, order_status="SUBMIT_ERROR", note=_describe(exc))
+            self._log("error", series, f"Sell failed {summary}: {_describe(exc)}")
             return
         self.store.update_exit(exit_id, order_status=OrderStatus.NEW.value)
         self._log("trade", series, f"Selling {summary}")
@@ -581,7 +708,7 @@ class Engine:
             filled = Decimal(e["filled_quantity"])
             if filled > 0:
                 sold += filled
-                value += filled * Decimal(e["avg_price"] or e["limit_price"])
+                value += filled * _price(e)
                 fees += Decimal(e["est_fees"]) * filled / Decimal(e["quantity"])
         self.store.update_trade(trade_id, sold_quantity=sold, sold_value=value, sell_fees=fees)
 
@@ -634,7 +761,7 @@ class Engine:
             status = order.status.value
             filled = order.filled_quantity or Decimal(0)
             fields: dict[str, Any] = {"order_status": status, "filled_quantity": filled}
-            if order.average_price is not None:
+            if order.average_price and filled > 0:  # Public reports 0 until something fills
                 fields["avg_price"] = order.average_price
             if status in TERMINAL_ORDER_STATUSES:
                 if filled == 0:
@@ -660,7 +787,7 @@ class Engine:
         status = order.status.value
         filled = order.filled_quantity or Decimal(0)
         fields: dict[str, Any] = {"order_status": status, "filled_quantity": filled}
-        if order.average_price is not None:
+        if order.average_price and filled > 0:  # Public reports 0 until something fills
             fields["avg_price"] = order.average_price
         if order.reject_reason:
             fields["note"] = order.reject_reason
@@ -720,6 +847,7 @@ class Engine:
 
     def snapshot(self) -> dict[str, Any]:
         stats = self.store.stats()
+        today_pnl, at_risk = self._today()
         empty = {"trades": 0, "wins": 0, "losses": 0, "pending": 0, "pnl": Decimal(0), "cost": Decimal(0)}
         markets = []
         open_pnl: Optional[Decimal] = None
@@ -742,6 +870,10 @@ class Engine:
                     "window_trade": _trade_summary(this_window) if this_window else None,
                     "position": position,
                     "stats": stats.get(market["series"], empty),
+                    "today": {
+                        "pnl": today_pnl.get(market["series"], Decimal(0)),
+                        "at_risk": at_risk.get(market["series"], Decimal(0)),
+                    },
                 }
             )
         totals: dict[str, Any] = dict(empty)
@@ -756,6 +888,12 @@ class Engine:
             "running": self.running,
             "markets": markets,
             "totals": totals,
+            "loss_limit": {
+                "limit": self.loss_limit(),
+                "halted_at": self.store.get_setting("halted_at"),
+                "today_pnl": sum(today_pnl.values(), Decimal(0)),
+                "at_risk": sum(at_risk.values(), Decimal(0)),
+            },
             "log": list(self.log)[::-1][:100],
             "server_time": utcnow().isoformat(),
         }
@@ -768,6 +906,13 @@ class Engine:
         log = logger.warning if level in ("warn", "error") else logger.info
         log("%s%s%s", self._prefix, f"[{series}] " if series else "", message)
         self.log.append({"time": now_iso(), "level": level, "series": series, "message": message})
+
+
+def _price(order: dict[str, Any]) -> Decimal:
+    """Price per contract of a trade's or a sell's order: the average it filled at, or its limit
+    price until it fills. Rows saved by earlier versions can hold Public's 0 for an unfilled order."""
+    avg = Decimal(order["avg_price"] or 0)
+    return avg if avg > 0 else Decimal(order["limit_price"])
 
 
 def _position(trade: dict[str, Any], window: Optional[Window], selling: bool = False) -> dict[str, Any]:
@@ -783,7 +928,7 @@ def _position(trade: dict[str, Any], window: Optional[Window], selling: bool = F
     sold = Decimal(trade.get("sold_quantity") or 0)
     held = filled - sold
     proceeds = Decimal(trade.get("sold_value") or 0) - Decimal(trade.get("sell_fees") or 0)
-    avg_price = Decimal(trade["avg_price"] or trade["limit_price"])
+    avg_price = _price(trade)
     fees = Decimal(trade["est_fees"]) * filled / quantity
     cost = filled * avg_price + fees
     trading = window is not None and window.event_symbol == trade["event_symbol"]
@@ -808,18 +953,37 @@ def _position(trade: dict[str, Any], window: Optional[Window], selling: bool = F
     }
 
 
+def _at_risk(trade: dict[str, Any]) -> Decimal:
+    """The most an unsettled trade could still lose: everything paid (or still to pay, while
+    its order is open) for contracts that might expire worthless, less what sold early."""
+    quantity = Decimal(trade["quantity"])
+    fees = Decimal(trade["est_fees"])
+    if trade["order_status"] in TERMINAL_ORDER_STATUSES:
+        filled = Decimal(trade["filled_quantity"])
+        cost = filled * Decimal(trade["avg_price"] or trade["limit_price"]) + fees * filled / quantity
+    else:
+        cost = quantity * Decimal(trade["limit_price"]) + fees  # the rest could still fill at the limit
+    proceeds = Decimal(trade["sold_value"]) - Decimal(trade["sell_fees"])
+    return max(Decimal(0), cost - proceeds)
+
+
 def _trade_summary(trade: dict[str, Any]) -> dict[str, Any]:
     """What a market card needs to say about its trade in the current window."""
     return {
         "side": trade["side"],
         "quantity": Decimal(trade["quantity"]),
         "filled": Decimal(trade["filled_quantity"]),
-        "price": Decimal(trade["avg_price"] or trade["limit_price"]),
+        "price": _price(trade),
         "sold": Decimal(trade["sold_quantity"]),
         "exit_reason": trade["exit_reason"],
         "result": trade["result"],
         "note": trade["note"],
     }
+
+
+def _not_opened_yet(exc: APIError) -> bool:
+    """Public's answer for a window it lists but can't return details for yet."""
+    return exc.status_code == 400 and "no event found" in exc.message.lower()
 
 
 async def _nothing() -> None:
@@ -856,3 +1020,20 @@ def _rate_limited_http_client(transport: RateLimitedTransport) -> httpx.AsyncCli
 
 def _cents(price: Decimal) -> str:
     return f"{(price / CENT):.0f}¢"
+
+
+def _connection_problem(exc: BaseException) -> Optional[str]:
+    """What went wrong, in plain words, if `exc` is Public being slow or unreachable; else None.
+
+    The SDK wraps these as an APIError with no message, so the cause is what tells them apart.
+    """
+    cause = exc if isinstance(exc, httpx.TransportError) else exc.__cause__
+    if isinstance(cause, httpx.TimeoutException):
+        return "Public took too long to answer"
+    if isinstance(cause, httpx.TransportError):
+        return "Couldn't reach Public"
+    return None
+
+
+def _describe(exc: BaseException) -> str:
+    return _connection_problem(exc) or str(exc)

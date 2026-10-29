@@ -71,3 +71,28 @@ def test_the_next_server_waits_for_the_old_one_to_stop():
         return waited, ready
 
     assert asyncio.run(run()) == (True, True)
+
+
+def test_connections_the_database_drops_are_replaced():
+    async def run():
+        await clean()
+        backend = PostgresBackend(URL)
+        await backend.open()
+        await backend.wait_for_lock()
+        # What the database does on a restart or a trusted-sources change: end every other connection.
+        killer = PostgresBackend(URL)
+        await killer.open()
+        async with killer._pool.connection() as conn:
+            await conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+            )
+        await killer.close()
+        await backend.add_session("s1", "hash", "key", "token")  # a fresh connection, not an error
+        lock_held = await backend.lock_held()  # the lock went with its connection
+        saved = [s for s, _ in await backend.load()]
+        await backend.close()
+        return saved, lock_held
+
+    saved, lock_held = asyncio.run(run())
+    assert saved == [("s1", "hash", "key", "token")] and lock_held is False

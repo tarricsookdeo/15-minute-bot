@@ -1,11 +1,42 @@
-# 15-Minute Bot
+# 15-Minute Prediction Market Trading Bot - Public.com
 
-A trading bot you run on your own computer. It trades Public.com's 15-minute prediction markets
-(BTC, ETH, Gold, EUR/USD, …) using rules you set for each market, and you control it from a
-dashboard in your browser.
+An open-source Python trading bot for automating 15-minute prediction markets on Public.com,
+including event contracts tied to Bitcoin (BTC), Ethereum (ETH), gold, and foreign exchange
+(forex).
 
-> **The bot places real orders with real money.** Nothing is traded until you press **Start**,
-> which asks you to confirm first. You can lose the full amount you pay for each contract.
+The bot uses the Public API and Python SDK to monitor available markets, evaluate contract prices,
+and place orders based on user-defined trading rules. It runs locally on your computer and
+includes a browser-based dashboard for managing strategies, monitoring positions, and tracking
+trading activity.
+
+![Public 15-minute prediction market trading bot dashboard showing automated strategies and event contract positions](docs/dashboard.png)
+
+*The dashboard, shown with sample data.*
+
+## Key features
+
+- **Automated 15-minute trading:** Monitor recurring prediction markets and place orders based on
+  predefined conditions.
+- **Multi-asset support:** Access supported Bitcoin, Ethereum, cryptocurrency, commodity, and
+  forex event contracts.
+- **Custom trading strategies:** Configure contract price ranges, trading windows, position sizes,
+  and eligible outcomes.
+- **Automated order execution:** Submit supported limit orders through Public’s API.
+- **Take-profit and stop-loss rules:** Configure optional early-exit conditions, subject to
+  liquidity and execution availability.
+- **Daily loss limits:** Set optional limits for the whole account and for each market. The bot
+  skips any buy that could take the day’s losses past a limit.
+- **Trading dashboard:** Monitor active markets, positions, profit and loss, win rates, and
+  transaction history.
+- **Local execution:** Run the bot on your computer with your own Public API credentials.
+
+> **Important:** This bot can place real trades using real money. Trading begins only after you
+> explicitly start it. Event contracts involve significant risk, including the potential loss of
+> the entire purchase amount plus applicable fees. Automated trading does not eliminate market or
+> execution risk.
+
+Explore [15-minute prediction markets on Public](https://public.com/prediction-markets/15-min) or
+read the [15-minute prediction market API and Python SDK guide](https://github.com/PublicDotCom/publicdotcom-py).
 
 ## Getting started
 
@@ -31,8 +62,8 @@ dashboard in your browser.
 ### 2. Get the code and install
 
 ```sh
-git clone https://github.com/PublicDotCom/15-minute-bot.git
-cd 15-minute-bot
+git clone https://github.com/PublicDotCom/15-minute-prediction-market-bot.git
+cd 15-minute-prediction-market-bot
 uv sync
 ```
 
@@ -71,9 +102,11 @@ caffeinate -i uv run python -m fifteen_bot
 2. **Account**: pick the brokerage account the bot should trade in.
 3. **Markets**: choose which 15-minute markets to trade. Start with one or two.
 4. **Your rule**: set when and what to buy, and optionally when to sell early (take-profit and
-   stop-loss). A live example shows what a trade would cost and pay.
-5. **Review**: check what each trade can cost, then **Start trading**, or **Finish without
-   starting** and press Start on the dashboard later.
+   stop-loss) and a daily loss limit for each market. A live example shows what a trade would
+   cost and pay.
+5. **Review**: check what each trade can cost, optionally set a daily loss limit for the whole
+   account, then **Start trading**, or **Finish without starting** and press Start on the
+   dashboard later.
 
 ### 6. Day to day
 
@@ -85,6 +118,8 @@ caffeinate -i uv run python -m fifteen_bot
   your key again to rejoin the same bot.
 - **Change a market's rule:** **Edit** on its card, or **Edit all strategies** for every market.
 - **Turn a market on/off:** the switch on its card.
+- **Daily loss limits (optional):** one for the whole account (**Edit** on the "Today" tile) and
+  one per market (in its rule). See "Daily loss limits" below for how they work.
 - **See results:** the dashboard shows total P&L, win rate, a per-market table, every trade and an
   activity log. A trade shows as won/lost a few minutes after its window closes, once Public
   settles it.
@@ -184,7 +219,7 @@ headers are trusted). Each person connects with their own key and gets their own
 | Use a different API key | Disconnect, then connect with the new key. |
 | Start completely fresh | Disconnect. With saving turned on you can also stop the app and delete `bot.db`. |
 
-## How trading works
+## How Automated 15-Minute Prediction Market Trading Works
 
 - A "market" is a recurring series such as `KXBTC15M`. Every 15 minutes it opens a new window
   (event). Each market has its own rule and can be switched on/off independently.
@@ -208,12 +243,33 @@ headers are trusted). Each person connects with their own key and gets their own
   (`$1 × contracts still held` if won, plus anything sold early, minus cost and Public's estimated
   fees). A position sold out completely is marked **sold** straight away, and counts as a win or a
   loss by its P&L.
-- **Selling event contracts through Public's API is untested**: the SDK only has a helper for
-  buying them, so sells are sent as generic `SELL` limit orders on the `EVENTCONTRACT` instrument.
-  Try a take-profit on a 1-contract position before relying on it.
+- **Selling early has been used in live trading:** stop-loss sells have filled through Public's
+  API. The SDK only has a helper for buying event contracts, so sells are sent as generic `SELL`
+  limit orders on the `EVENTCONTRACT` instrument. A sell still isn't guaranteed to fill, so try a
+  take-profit or stop-loss on a 1-contract position before relying on it.
 - With saving turned on, **every order is saved before it's sent**, so even after a crash the app
   knows about every order that could exist at Public and never places one twice. If the database
   can't be written, the bot doesn't send the order.
+
+### Daily loss limits
+
+Both are optional: one for the whole account, and one per market (part of the market's rule).
+
+- **A limit is never passed.** Before each buy the bot works out the worst case for the day:
+  today's settled P&L (gains give room), plus everything its open trades could still lose (as if
+  every one lost; an order still filling counts in full), plus this buy and its fees. If that
+  could pass the market's limit, or the account's limit across every market, the buy isn't
+  placed. Buys that happen at the same moment in several markets can't pass a limit together.
+- **Once a buy is skipped, buying stays stopped:** for that market, until you press **Resume** on
+  its card (or switch it off and on); for the account limit, on every market, until you press
+  **Resume** in the top bar (or Stop and Start). It doesn't restart by itself, even on a new day.
+  Resuming with the same limit on the same day usually stops again at the next buy, so raise the
+  limit first to trade more that day.
+- **Selling carries on while buying is stopped:** take-profit and stop-loss sells, and settlement,
+  continue as normal.
+- **A day starts at midnight US Eastern**, so only trades that settled since then count as today's.
+- Only the bot's own trades count, from this session: not other trades in your Public account,
+  and not trades from before a Disconnect.
 
 ### Staying under Public's rate limit
 
@@ -224,6 +280,59 @@ Retry-After time. To keep traffic low, prices for all markets come from one batc
 and open orders from one order search; typical use is 1–3 requests per second. Requests time out
 after 10 seconds, so one slow response can't make the bot miss a buy window. Other tools calling
 Public's API for the same account at the same time count toward the same limit.
+
+## Frequently asked questions
+
+### What is a 15-minute prediction market trading bot?
+
+A 15-minute prediction market trading bot is software that monitors short-duration event contracts
+and executes supported trades based on predefined rules. Public’s open-source Python bot supports
+automated workflows for eligible 15-minute prediction markets using the Public API.
+
+### Can you automate 15-minute Bitcoin prediction markets?
+
+Yes. Public’s 15-minute trading bot supports automated trading workflows for Bitcoin (BTC) event
+contracts. Users can configure conditions such as contract prices, time remaining, and position
+sizes. Orders are subject to market availability, liquidity, and execution limitations.
+
+### Where can I find an open-source 15-minute prediction market bot?
+
+The Public 15-Minute Bot is an open-source Python project for automating supported prediction
+market trading through Public’s API. It includes configurable strategies, order execution, and a
+browser-based dashboard.
+
+### Does the bot support Ethereum, gold, and forex prediction markets?
+
+Yes. The bot supports available 15-minute event contract series across multiple asset classes,
+including Bitcoin, Ethereum, gold, and selected forex pairs. Specific market availability depends
+on the contracts supported through Public’s API.
+
+### Does the bot use Public’s API and Python SDK?
+
+Yes. The bot uses the official [Public Python SDK](https://github.com/PublicDotCom/publicdotcom-py)
+to communicate with Public’s API, retrieve supported market information, and submit orders.
+Developers can also follow the
+[15-minute prediction market API guide](https://github.com/PublicDotCom/publicdotcom-py) to build
+their own programmatic workflows.
+
+### Can I configure take-profit and stop-loss rules?
+
+Yes. The bot includes optional take-profit and stop-loss settings for attempting to close
+positions before expiration, and early sells have filled in live trading through Public’s API.
+However, orders may fail to execute, and configured thresholds do not guarantee a particular exit
+price or limit losses. To cap how much the bot can lose in a day, set a daily loss limit.
+
+### Does the bot run 24/7?
+
+The bot can monitor supported 15-minute prediction markets continuously while the application is
+running and the computer remains awake. It stops operating if the application closes or the
+computer sleeps. Market availability and trading interruptions may affect execution.
+
+### Is automated prediction market trading profitable?
+
+Profitability is not guaranteed. Automated trading strategies remain exposed to market
+fluctuations, trading fees, liquidity constraints, and execution risk. The bot’s historical
+win-rate and profit-and-loss reporting do not predict future performance.
 
 ## For developers
 
@@ -244,6 +353,7 @@ fifteen_bot/
   store.py      in-memory SQLite for one session's markets, rules and trades
   static/       dashboard (plain HTML/CSS/JS, no build step)
 .github/        CI: the tests, on every pull request
+docs/           the dashboard screenshot in this README
 tests/          uv run pytest
 ```
 

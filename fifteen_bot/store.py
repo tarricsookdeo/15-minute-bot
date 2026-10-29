@@ -25,7 +25,10 @@ CREATE TABLE IF NOT EXISTS markets (
     category TEXT,
     enabled INTEGER NOT NULL DEFAULT 0,
     strategy TEXT NOT NULL,
-    added_at TEXT NOT NULL
+    added_at TEXT NOT NULL,
+    -- set when buying stopped because the market's daily loss limit could be passed;
+    -- cleared by switching the market back on
+    halted_at TEXT
 );
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,10 +187,17 @@ class Store:
     ) -> None:
         if enabled is not None:
             self.db.execute("UPDATE markets SET enabled = ? WHERE series = ?", (int(enabled), series))
+            if enabled:
+                self.db.execute("UPDATE markets SET halted_at = NULL WHERE series = ?", (series,))
         if strategy is not None:
             self.db.execute(
                 "UPDATE markets SET strategy = ? WHERE series = ?", (strategy.model_dump_json(), series)
             )
+        self.db.commit()
+        self._changed("markets", series)
+
+    def halt_market(self, series: str) -> None:
+        self.db.execute("UPDATE markets SET halted_at = ? WHERE series = ?", (now_iso(), series))
         self.db.commit()
         self._changed("markets", series)
 
@@ -281,6 +291,18 @@ class Store:
         marks = ", ".join("?" for _ in FINAL_RESULTS)
         rows = self.db.execute(f"SELECT * FROM trades WHERE result NOT IN ({marks})", FINAL_RESULTS)
         return [dict(row) for row in rows.fetchall()]
+
+    def pending_trades(self) -> list[dict[str, Any]]:
+        """Trades whose result isn't known yet: their money is still at risk."""
+        return [dict(row) for row in self.db.execute("SELECT * FROM trades WHERE result = 'PENDING'").fetchall()]
+
+    def pnl_since(self, since: str) -> dict[str, Decimal]:
+        """Net P&L per market of the trades that settled (or sold out) at or after `since`."""
+        out: dict[str, Decimal] = {}
+        rows = self.db.execute("SELECT series, pnl FROM trades WHERE settled_at >= ? AND pnl IS NOT NULL", (since,))
+        for row in rows.fetchall():
+            out[row["series"]] = out.get(row["series"], Decimal(0)) + Decimal(row["pnl"])
+        return out
 
     def stats(self) -> dict[str, dict[str, Any]]:
         """Per-market performance, keyed by series."""
