@@ -1,9 +1,9 @@
 # Deploying the 15-Minute Bot
 
 This repository, **tarricsookdeo/15-minute-bot**, is a fork of
-[PublicDotCom/15-minute-bot](https://github.com/PublicDotCom/15-minute-bot), the source of truth
-for the app, and is the copy that's deployed. It's the upstream code plus only these files, which
-upstream doesn't have:
+[PublicDotCom/15-minute-prediction-market-bot](https://github.com/PublicDotCom/15-minute-prediction-market-bot),
+the source of truth for the app, and is the copy that's deployed. It's the upstream code plus only
+these files, which upstream doesn't have:
 
 | File | What it is |
 |---|---|
@@ -18,12 +18,12 @@ Everything else (app code, tests, `README.md`, `.github/workflows/ci.yml`) is sh
 ## Making changes
 
 - **App changes go to upstream first:** open the pull request against
-  `PublicDotCom/15-minute-bot`, and merge it there.
+  `PublicDotCom/15-minute-prediction-market-bot`, and merge it there.
 - **Then sync this fork**, which deploys it: the **Sync fork** button on this repository's GitHub
   page, or:
 
   ```sh
-  gh repo sync tarricsookdeo/15-minute-bot --source PublicDotCom/15-minute-bot --branch main
+  gh repo sync tarricsookdeo/15-minute-bot --source PublicDotCom/15-minute-prediction-market-bot --branch main
   ```
 
   Never add `--force`: it resets this fork to upstream and deletes the deployment files. The same

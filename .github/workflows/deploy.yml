@@ -1,5 +1,6 @@
-# Fork-only (not in PublicDotCom/15-minute-bot; see DEPLOY.md). Every push to main (a merged pull
-# request, or syncing this fork with upstream) is tested, then deployed to DigitalOcean App Platform.
+# Fork-only (not in PublicDotCom/15-minute-prediction-market-bot; see DEPLOY.md). Every push to
+# main (a merged pull request, or syncing this fork with upstream) is tested, then deployed to
+# DigitalOcean App Platform.
 # Needs, in the repository's settings:
 #   secret   DIGITALOCEAN_ACCESS_TOKEN  a DigitalOcean API token (read + write)
 #   secret   SESSION_ENCRYPTION_KEY     encrypts stored API keys (see DEPLOY.md); never change it

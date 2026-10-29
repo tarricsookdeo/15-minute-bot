@@ -1,5 +1,5 @@
-# Fork-only (not in PublicDotCom/15-minute-bot): the production image builds and starts
-# healthy as a non-root user. Runs on pull requests here and before every deploy.
+# Fork-only (not in PublicDotCom/15-minute-prediction-market-bot): the production image builds and
+# starts healthy as a non-root user. Runs on pull requests here and before every deploy.
 name: Container
 
 on:
